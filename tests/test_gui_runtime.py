@@ -95,6 +95,7 @@ class PersistentDiagnosticsTests(unittest.TestCase):
                     "status": "starting",
                     "mode": "single",
                     "audio_source": "original",
+                    "model": "large-v3",
                     "required_modules": ["faster_whisper", "rapidfuzz"],
                     "selected_python": {
                         "path": sys.executable,
@@ -147,6 +148,26 @@ class RuntimePresentationTests(unittest.TestCase):
 
         self.assertEqual(result["video"], r"C:\media\song.mp4")
         self.assertEqual(result["lyrics"], r"C:\media\歌词.txt")
+
+    def test_selected_model_is_passed_without_free_form_parameters(self):
+        command = gui._build_processing_command(
+            "python.exe",
+            {
+                "mode": "single",
+                "video": "song.mp4",
+                "lyrics": "song.txt",
+                "output": "",
+                "audio_source": "original",
+                "model": "large-v3-turbo",
+                "no_vad": False,
+                "no_burn": True,
+                "refresh": False,
+            },
+        )
+
+        self.assertIn("--model", command)
+        self.assertEqual(command[command.index("--model") + 1], "large-v3-turbo")
+        self.assertIn("--no-burn", command)
 
 
 if __name__ == "__main__":

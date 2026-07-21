@@ -79,6 +79,28 @@ PYTHON_MODULES = (
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".m4v"}
 LYRIC_EXTENSIONS = {".txt", ".lrc"}
 STAGE_PROGRESS = {1: 5, 2: 14, 3: 24, 4: 38, 5: 78, 6: 88, 7: 95}
+MODEL_OPTIONS = (
+    {
+        "id": "large-v3",
+        "label": "Large v3 — 日语歌曲、复杂音频（默认）",
+        "description": "日语歌曲、现场或背景声复杂的视频；精度优先，处理最慢。",
+    },
+    {
+        "id": "large-v3-turbo",
+        "label": "Large v3 Turbo — 访谈、解说、一般视频",
+        "description": "访谈、解说和一般视频；接近 Large v3，处理速度更快。",
+    },
+    {
+        "id": "medium",
+        "label": "Medium — 清晰语音、低配置",
+        "description": "语音较清晰或硬件资源有限的视频；速度与精度折中。",
+    },
+    {
+        "id": "small",
+        "label": "Small — 快速草稿、CPU",
+        "description": "清晰单人语音、快速草稿或 CPU；不建议用于歌曲和嘈杂音频。",
+    },
+)
 
 THEMES = {
     "light": {
@@ -357,6 +379,7 @@ def parse_runtime_line(raw_line: str) -> dict | None:
         "已有 Whisper",
         "Whisper 识别完成",
         "Whisper 转录缓存",
+        "正在加载 Whisper 模型:",
         "使用设备:",
         "文本锚点:",
         "英文锚点",
@@ -382,6 +405,39 @@ def parse_runtime_line(raw_line: str) -> dict | None:
     ):
         return {"kind": "log", "message": cleaned}
     return None
+
+
+def _build_processing_command(python_exe: str, config: dict) -> list[str]:
+    """根据界面中有限的选项构建核心脚本命令。"""
+    command = [python_exe, "-u", str(SYNC_SCRIPT)]
+    if config["mode"] == "single":
+        command += ["--video", config["video"], "--lyrics", config["lyrics"]]
+        if config.get("output"):
+            command += ["--output", config["output"]]
+    else:
+        command += [
+            "--batch",
+            "--video-dir",
+            config["video_dir"],
+            "--lyrics-dir",
+            config["lyrics_dir"],
+        ]
+        if config.get("output_dir"):
+            command += ["--output-dir", config["output_dir"]]
+
+    command += [
+        "--audio-source",
+        config["audio_source"],
+        "--model",
+        config["model"],
+    ]
+    if config.get("no_vad"):
+        command.append("--no-vad")
+    if config.get("no_burn"):
+        command.append("--no-burn")
+    if config.get("refresh"):
+        command.append("--refresh-transcript")
+    return command
 
 
 class PathLineEdit(QLineEdit):
@@ -568,7 +624,7 @@ class App(QMainWindow):
         form_layout.addStretch()
         splitter.addWidget(form_scroll)
         splitter.addWidget(self._build_log_panel())
-        splitter.setSizes([390, 230])
+        splitter.setSizes([470, 150])
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
 
@@ -704,6 +760,26 @@ class App(QMainWindow):
         heading.setObjectName("sectionTitle")
         grid.addWidget(heading, 0, 0, 1, 4)
 
+        model_label = QLabel("语音模型")
+        model_label.setObjectName("fieldLabel")
+        self.model_combo = QComboBox()
+        for index, option in enumerate(MODEL_OPTIONS):
+            self.model_combo.addItem(option["label"], option["id"])
+            self.model_combo.setItemData(
+                index,
+                option["description"],
+                Qt.ItemDataRole.ToolTipRole,
+            )
+        self.model_combo.setToolTip("首次使用所选模型时会自动下载，之后从本机缓存加载。")
+        self.model_description = QLabel()
+        self.model_description.setObjectName("mutedLabel")
+        self.model_description.setWordWrap(True)
+        self.model_combo.currentIndexChanged.connect(self._update_model_description)
+        self._update_model_description()
+        grid.addWidget(model_label, 1, 0)
+        grid.addWidget(self.model_combo, 1, 1, 1, 3)
+        grid.addWidget(self.model_description, 2, 1, 1, 3)
+
         source_label = QLabel("识别音源")
         source_label.setObjectName("fieldLabel")
         self.audio_source_combo = QComboBox()
@@ -713,8 +789,8 @@ class App(QMainWindow):
             "分离人声会先去掉大部分伴奏，通常更适合歌曲识别，但处理时间更长。\n"
             "原始音频会直接识别视频中的混音。"
         )
-        grid.addWidget(source_label, 1, 0)
-        grid.addWidget(self.audio_source_combo, 1, 1)
+        grid.addWidget(source_label, 3, 0)
+        grid.addWidget(self.audio_source_combo, 3, 1)
 
         self.no_burn_cb = QCheckBox("仅生成 SRT")
         self.no_burn_cb.setToolTip("生成 SRT 和对轴报告，不重新编码视频。识别步骤仍会运行。")
@@ -722,11 +798,20 @@ class App(QMainWindow):
         self.refresh_cb.setToolTip("忽略已有 Whisper 缓存，重新提取音频并识别。")
         self.no_vad_cb = QCheckBox("禁用 VAD")
         self.no_vad_cb.setToolTip("保留所有音频区间。通常无需开启。")
-        grid.addWidget(self.no_burn_cb, 1, 2)
-        grid.addWidget(self.refresh_cb, 1, 3)
-        grid.addWidget(self.no_vad_cb, 2, 2)
+        grid.addWidget(self.no_burn_cb, 3, 2)
+        grid.addWidget(self.refresh_cb, 3, 3)
+        grid.addWidget(self.no_vad_cb, 4, 2)
         grid.setColumnStretch(1, 1)
         return card
+
+    def _update_model_description(self) -> None:
+        if not hasattr(self, "model_description"):
+            return
+        model_id = self.model_combo.currentData()
+        option = next(item for item in MODEL_OPTIONS if item["id"] == model_id)
+        self.model_description.setText(
+            option["description"] + " 首次使用会自动下载并缓存。"
+        )
 
     def _build_log_panel(self) -> QWidget:
         panel = QFrame()
@@ -977,6 +1062,7 @@ class App(QMainWindow):
         config = {
             "mode": mode,
             "audio_source": self.audio_source_combo.currentData(),
+            "model": self.model_combo.currentData(),
             "no_vad": self.no_vad_cb.isChecked(),
             "no_burn": self.no_burn_cb.isChecked(),
             "refresh": self.refresh_cb.isChecked(),
@@ -1051,6 +1137,7 @@ class App(QMainWindow):
                 {
                     "started_at": timestamp,
                     "status": "preflight_failed",
+                    "model": config["model"],
                     "required_modules": sorted(required_modules),
                     "error": str(error),
                     "log_path": str(LATEST_LOG),
@@ -1063,29 +1150,7 @@ class App(QMainWindow):
             return
 
         python_exe = selected_python["path"]
-        cmd = [python_exe, "-u", str(SYNC_SCRIPT)]
-        if config["mode"] == "single":
-            cmd += ["--video", config["video"], "--lyrics", config["lyrics"]]
-            if config["output"]:
-                cmd += ["--output", config["output"]]
-        else:
-            cmd += [
-                "--batch",
-                "--video-dir",
-                config["video_dir"],
-                "--lyrics-dir",
-                config["lyrics_dir"],
-            ]
-            if config["output_dir"]:
-                cmd += ["--output-dir", config["output_dir"]]
-
-        cmd += ["--audio-source", config["audio_source"]]
-        if config["no_vad"]:
-            cmd.append("--no-vad")
-        if config["no_burn"]:
-            cmd.append("--no-burn")
-        if config["refresh"]:
-            cmd.append("--refresh-transcript")
+        cmd = _build_processing_command(python_exe, config)
 
         run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
         context = {
@@ -1094,6 +1159,7 @@ class App(QMainWindow):
             "status": "starting",
             "mode": config["mode"],
             "audio_source": config["audio_source"],
+            "model": config["model"],
             "required_modules": sorted(required_modules),
             "selected_python": selected_python,
             "python_candidates": python_probes,
@@ -1134,6 +1200,7 @@ class App(QMainWindow):
                     f"运行时间: {run_context['started_at']}\n"
                     f"Python: {run_context['selected_python']['path']}\n"
                     f"Python 来源: {run_context['selected_python']['source']}\n"
+                    f"识别模型: {run_context['model']}\n"
                     f"识别音源: {run_context['audio_source']}\n"
                     f"命令: {subprocess.list2cmdline(cmd)}\n"
                     f"{'─' * 60}\n"
@@ -1245,6 +1312,7 @@ class App(QMainWindow):
         self.start_btn.setText("处理中" if running else "开始处理")
         self.mode_tabs.setEnabled(not running)
         self.audio_source_combo.setEnabled(not running)
+        self.model_combo.setEnabled(not running)
         self.no_burn_cb.setEnabled(not running)
         self.refresh_cb.setEnabled(not running)
         self.no_vad_cb.setEnabled(not running)

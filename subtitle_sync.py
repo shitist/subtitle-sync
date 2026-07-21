@@ -7,7 +7,7 @@ subtitle_sync.py
 工作流程:
   1. FFmpeg 提取音频
   2. Demucs 人声分离（去掉背景音乐，提升 Whisper 准确率）
-  3. faster-whisper large-v3 独立识别日语并输出 word 级时间戳
+  3. faster-whisper 可选模型独立识别日语并输出 word 级时间戳
   4. 智能对轴：
      - 若有日文歌词：fuzzy matching（rapidfuzz）日→日匹配，再映射到中文
      - 若仅中文歌词：优先使用英文锚点局部对齐，否则低置信度时间回退
@@ -57,6 +57,13 @@ if sys.platform == "win32":
 
 TRANSCRIPT_CACHE_SCHEMA = 2
 DEFAULT_MIN_MATCH_SCORE = 55.0
+DEFAULT_WHISPER_MODEL = "large-v3"
+SUPPORTED_WHISPER_MODELS = (
+    "large-v3",
+    "large-v3-turbo",
+    "medium",
+    "small",
+)
 
 
 @dataclass(frozen=True)
@@ -165,13 +172,15 @@ def separate_vocals(audio_path: Path, work_dir: Path) -> Path:
 
 def transcribe_audio(
     audio_path: Path,
+    model_name: str = DEFAULT_WHISPER_MODEL,
     use_vad: bool = True,
 ) -> list:
     """
-    用 faster-whisper large-v3 识别日语，返回片段列表。
+    用选定的 faster-whisper 模型识别日语，返回片段列表。
 
     参数:
       audio_path:     人声 WAV 文件路径
+      model_name:     faster-whisper 模型名称
       use_vad:        是否启用 VAD 静音过滤
 
     返回:
@@ -182,12 +191,12 @@ def transcribe_audio(
     except ImportError:
         _die("未安装 faster-whisper，请运行: pip install faster-whisper")
 
-    print("    正在加载 Whisper large-v3 模型（首次运行会下载，约 3GB）...")
+    print(f"    正在加载 Whisper 模型: {model_name}（首次使用会自动下载）...")
 
     device, compute_type = _detect_device()
     print(f"    使用设备: {device} / {compute_type}")
 
-    model = WhisperModel("large-v3", device=device, compute_type=compute_type)
+    model = WhisperModel(model_name, device=device, compute_type=compute_type)
 
     # ── 构建转录参数 ──
     transcribe_kwargs = {
@@ -1011,11 +1020,12 @@ def _transcript_metadata(
     video_path: Path,
     use_vad: bool,
     audio_source: str,
+    model_name: str = DEFAULT_WHISPER_MODEL,
 ) -> dict:
     # 识别不再依赖歌词内容；同一音视频设置可在纯中文/双语歌词间复用缓存。
     return {
         "schema_version": TRANSCRIPT_CACHE_SCHEMA,
-        "model": "large-v3",
+        "model": model_name,
         "language": "ja",
         "transcription_profile": "audio-ja-v2-no-lyric-prompt",
         "use_vad": use_vad,
@@ -1087,6 +1097,7 @@ def process_single(
     no_burn: bool = False,
     refresh_transcript: bool = False,
     audio_source: str = "vocals",
+    model_name: str = DEFAULT_WHISPER_MODEL,
     min_match_score: float = DEFAULT_MIN_MATCH_SCORE,
 ) -> None:
     """处理单个视频文件。"""
@@ -1100,6 +1111,8 @@ def process_single(
 
     if audio_source not in {"vocals", "original"}:
         raise ValueError(f"不支持的音源模式: {audio_source}")
+    if model_name not in SUPPORTED_WHISPER_MODELS:
+        raise ValueError(f"不支持的 Whisper 模型: {model_name}")
 
     _banner(f"处理: {video_path.name}")
 
@@ -1114,6 +1127,7 @@ def process_single(
             video_path,
             use_vad=not no_vad,
             audio_source=audio_source,
+            model_name=model_name,
         )
         segments = None if refresh_transcript else load_transcript_cache(cache_path, metadata)
 
@@ -1129,9 +1143,10 @@ def process_single(
                 _step(3, 7, "使用原始混合音频（跳过 Demucs）")
                 transcription_audio = audio_wav
 
-            _step(4, 7, "Whisper large-v3 日语识别")
+            _step(4, 7, f"Whisper {model_name} 日语识别")
             segments = transcribe_audio(
                 transcription_audio,
+                model_name=model_name,
                 use_vad=not no_vad,
             )
             save_transcript_cache(cache_path, segments, metadata)
@@ -1183,6 +1198,7 @@ def process_batch(
     no_burn: bool = False,
     refresh_transcript: bool = False,
     audio_source: str = "vocals",
+    model_name: str = DEFAULT_WHISPER_MODEL,
     min_match_score: float = DEFAULT_MIN_MATCH_SCORE,
 ) -> None:
     """批量处理目录下的所有视频文件。"""
@@ -1221,6 +1237,7 @@ def process_batch(
                 no_burn=no_burn,
                 refresh_transcript=refresh_transcript,
                 audio_source=audio_source,
+                model_name=model_name,
                 min_match_score=min_match_score,
             )
         except Exception as e:
@@ -1358,6 +1375,12 @@ def main() -> None:
         help="Whisper 音源：Demucs 人声或原始混合音频（默认: vocals）",
     )
     parser.add_argument(
+        "--model",
+        choices=SUPPORTED_WHISPER_MODELS,
+        default=DEFAULT_WHISPER_MODEL,
+        help=f"Whisper 模型（默认: {DEFAULT_WHISPER_MODEL}）",
+    )
+    parser.add_argument(
         "--min-match-score",
         type=float,
         default=DEFAULT_MIN_MATCH_SCORE,
@@ -1386,6 +1409,7 @@ def main() -> None:
             no_burn=args.no_burn,
             refresh_transcript=args.refresh_transcript,
             audio_source=args.audio_source,
+            model_name=args.model,
             min_match_score=args.min_match_score,
         )
     else:
@@ -1399,6 +1423,7 @@ def main() -> None:
             no_burn=args.no_burn,
             refresh_transcript=args.refresh_transcript,
             audio_source=args.audio_source,
+            model_name=args.model,
             min_match_score=args.min_match_score,
         )
 

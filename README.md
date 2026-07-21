@@ -2,6 +2,42 @@
 
 从日语歌曲视频提取音频，识别日文歌声，并把逐行中文字幕生成 SRT 或烧入视频。
 
+这个工具做的是“把已有中文字幕对到音频时间轴”，不是翻译器，也不是完整的字幕编辑器。当前界面和识别参数以日语内容为准。
+
+## 适合场景与局限
+
+适合：
+
+- 日语歌曲、MV、Live 等音乐视频。推荐提供行数对应的中文与日文歌词。
+- 日语访谈、解说、Vlog、动画对白等非音乐视频。语音清楚时通常比歌曲更容易识别。
+- 已经有逐行中文字幕，只需要生成 SRT 时间轴或烧入视频。
+- 先自动生成初稿，再结合 `alignment.json` 和播放器进行人工复核。
+
+目前的局限：
+
+- 不会把日语自动翻译成中文，必须提供准备好的中文字幕或歌词。
+- 识别语言固定为日语。Whisper 本身支持其他语言，但本工具没有提供语言选择，也没有验证其他语言的歌词解析与匹配效果。
+- 歌唱、和声、多人重叠、现场噪声、混响和重伴奏都会降低识别与文本锚点覆盖率。
+- 没有匹配到的歌词行会在相邻锚点之间补时间，不能保证达到逐帧精度；锚点覆盖率低时必须复核。
+- 不处理说话人区分、字幕断句改写、翻译、特效字幕或复杂排版。
+
+非音乐视频通常直接选择“原始音频”即可；“分离人声”主要用于伴奏较重的歌曲，也可能带来分离失真。
+
+## 语音模型
+
+界面只提供四个预设，不需要填写模型名称或识别参数：
+
+| 选项 | 适合内容 | 取舍 |
+|---|---|---|
+| `Large v3`（默认） | 日语歌曲、现场、背景声复杂或音质一般的视频 | 精度优先，速度最慢，资源占用最高 |
+| `Large v3 Turbo` | 访谈、解说、Vlog 和一般视频 | 接近 Large v3，处理明显更快 |
+| `Medium` | 较清晰的语音、硬件资源有限的电脑 | 速度与精度折中 |
+| `Small` | 清晰单人语音、快速草稿、CPU 环境 | 最轻量，不建议用于歌曲和嘈杂音频 |
+
+第一次使用某个模型时，faster-whisper 会从 Hugging Face 自动下载并保存在本机缓存中，之后无需重复下载。切换模型会使当前输出旁的 `.whisper.json` 转录缓存失效并重新识别；模型权重缓存不会被删除。
+
+模型能力和相对速度可参考 [OpenAI Whisper 模型表](https://github.com/openai/whisper#available-models-and-languages)，自动下载行为见 [faster-whisper 使用说明](https://github.com/SYSTRAN/faster-whisper#model-conversion)。
+
 ## 对轴方式
 
 推荐使用逐行双语歌词：
@@ -16,7 +52,7 @@
 
 ```text
 视频 → FFmpeg 提取音频 → Demucs 人声分离（可选）
-     → faster-whisper large-v3 逐词识别
+     → faster-whisper 所选模型逐词识别
      → 日文歌词与识别文本进行顺序受限匹配
      → 高分匹配作为时间锚点，漏识别行在相邻锚点间局部补齐
      → SRT + 对轴报告 → 可选 FFmpeg 硬字幕烧入
@@ -28,7 +64,8 @@
 
 - Python 3.10+
 - FFmpeg（推荐加入系统 `PATH`）
-- 首次使用 `large-v3` 时需要下载约 3 GB 模型
+- 首次使用所选模型时需要联网自动下载
+- 模型越大，对内存或显存的要求越高
 
 安装 Python 依赖：
 
@@ -92,6 +129,7 @@ python subtitle_sync_gui.py
 - 单文件和批量处理
 - 跟随系统、浅色和深色三种外观
 - 将视频和歌词直接拖入窗口
+- 四档语音模型预设及适用场景说明
 - Demucs 人声或原始混合音频
 - 仅生成 SRT，不烧录视频
 - 强制重新运行 Whisper
@@ -135,6 +173,12 @@ python subtitle_sync.py --video song.mp4 --lyrics song.txt --no-burn
 
 ```powershell
 python subtitle_sync.py --video song.mp4 --lyrics song.txt --audio-source original
+```
+
+使用速度更快的 Turbo 模型：
+
+```powershell
+python subtitle_sync.py --video song.mp4 --lyrics song.txt --model large-v3-turbo
 ```
 
 忽略已有转录缓存并重新识别：
@@ -181,7 +225,7 @@ python subtitle_sync.py --batch --video-dir ./videos --lyrics-dir ./lyrics
 - `interpolated`：Whisper 漏识别，时间由相邻锚点局部补齐
 - `timing_fallback`：没有日文原文，只能按声音边界估算
 
-修改歌词、对轴算法或相似度阈值时可以直接复用 `.whisper.json`，无需重新运行 Demucs 和 Whisper。输入视频、VAD、音源或识别配置变化时缓存会自动失效。
+修改歌词、对轴算法或相似度阈值时可以直接复用 `.whisper.json`，无需重新运行 Demucs 和 Whisper。输入视频、模型、VAD、音源或识别配置变化时缓存会自动失效。
 
 ## 打包说明
 

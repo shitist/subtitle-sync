@@ -199,6 +199,23 @@ class ArtifactTests(unittest.TestCase):
         self.assertEqual(metadata_a, metadata_b)
         self.assertNotIn("lyrics", metadata_a)
 
+    def test_transcript_metadata_changes_with_selected_model(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            video = Path(temp_dir) / "sample.mp4"
+            video.write_bytes(b"same-video")
+
+            large = _transcript_metadata(video, True, "vocals", "large-v3")
+            turbo = _transcript_metadata(
+                video,
+                True,
+                "vocals",
+                "large-v3-turbo",
+            )
+
+        self.assertEqual(large["model"], "large-v3")
+        self.assertEqual(turbo["model"], "large-v3-turbo")
+        self.assertNotEqual(large, turbo)
+
     def test_transcript_cache_round_trip_and_metadata_guard(self):
         segments = [SimpleSegment(
             1.0,
