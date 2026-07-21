@@ -1,8 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""
-PyInstaller spec for subtitle_sync_gui
-打包成单文件夹，包含 GUI + subtitle_sync.py
-"""
+"""PyInstaller spec：打包 PySide6 GUI，并附带可外置更新的核心脚本。"""
 
 import sys
 from pathlib import Path
@@ -18,11 +15,9 @@ a = Analysis(
         (str(_project / "requirements.txt"), "."),
     ],
     hiddenimports=[
-        "tkinter",
-        "tkinter.font",
-        "tkinter.ttk",
-        "tkinter.filedialog",
-        "tkinter.messagebox",
+        "PySide6.QtCore",
+        "PySide6.QtGui",
+        "PySide6.QtWidgets",
     ],
     hookspath=[],
     hooksconfig={},
@@ -57,6 +52,9 @@ a = Analysis(
         "cv2",
         "matplotlib",
         "scipy",
+        "tkinter",
+        "PyQt5",
+        "PyQt6",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

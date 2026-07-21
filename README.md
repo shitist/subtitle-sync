@@ -36,6 +36,12 @@
 pip install -r requirements.txt
 ```
 
+从源码运行或打包图形界面时，再安装：
+
+```powershell
+pip install -r requirements-gui.txt
+```
+
 有 NVIDIA 显卡时需要安装与本机 CUDA 环境匹配的 PyTorch/CTranslate2 运行库。没有可用 GPU 时会使用 CPU `int8`。
 
 ## 歌词格式
@@ -84,10 +90,15 @@ python subtitle_sync_gui.py
 界面支持：
 
 - 单文件和批量处理
+- 跟随系统、浅色和深色三种外观
+- 将视频和歌词直接拖入窗口
 - Demucs 人声或原始混合音频
 - 仅生成 SRT，不烧录视频
 - 强制重新运行 Whisper
 - 启用或禁用 VAD
+- 固定显示当前阶段、进度条和已运行时间
+
+界面只显示阶段、匹配摘要和输出路径。Whisper 的逐段识别文字仍会保存在完整日志中，不再占满窗口。
 
 GUI 启动处理前会扫描项目虚拟环境、`PATH` 和 Windows Python Launcher 注册的解释器，并逐一检查 Python 版本及 `faster_whisper`、`rapidfuzz`、`demucs` 等模块。选择 Demucs 人声时，缺少 `demucs` 的解释器不会被采用；没有合格环境时会在提取音频前停止并列出缺失模块。
 
@@ -118,7 +129,7 @@ python subtitle_sync.py --video song.mp4 --lyrics song.txt
 python subtitle_sync.py --video song.mp4 --lyrics song.txt --no-burn
 ```
 
-`--no-burn` 只跳过最后的 FFmpeg 视频重编码；首次运行仍需进行音频提取、可选的 Demucs 人声分离和 Whisper 识别，因此不会立刻完成。识别结果写入 `.whisper.json` 后，只要视频、歌词、VAD 和音源设置不变，后续调整对轴会直接复用缓存。GUI 在长步骤中每 30 秒写入一次运行心跳，并实时刷新已经产生的 Whisper 片段。
+`--no-burn` 只跳过最后的 FFmpeg 视频重编码；首次运行仍需进行音频提取、可选的 Demucs 人声分离和 Whisper 识别，因此不会立刻完成。识别结果写入 `.whisper.json` 后，只要视频、VAD、音源和识别配置不变，更换歌词或调整对轴算法都会直接复用缓存。GUI 会持续显示当前阶段和已运行时间，完整输出另存到日志文件。
 
 使用原始混合音频识别，跳过 Demucs：
 
@@ -175,10 +186,11 @@ python subtitle_sync.py --batch --video-dir ./videos --lyrics-dir ./lyrics
 ## 打包说明
 
 ```powershell
+pip install -r requirements-gui.txt
 pyinstaller build.spec
 ```
 
-打包后的 `SubtitleSync.exe` 是轻量 GUI 启动器，不内置 Whisper、Demucs 和模型。目标机器仍需安装可用的 Python 3.10+ 及 `requirements.txt` 中的依赖。EXE 会优先使用同目录的 `subtitle_sync.py`，方便更新核心算法。
+打包后的 `SubtitleSync.exe` 内置 PySide6 界面，但不内置 Whisper、Demucs 和模型。目标机器仍需安装可用的 Python 3.10+ 及 `requirements.txt` 中的依赖。EXE 会优先使用同目录的 `subtitle_sync.py`，方便更新核心算法。由于包含 Qt 运行库，新版 EXE 会比原来的 Tkinter 版本大。
 
 ## 测试
 
@@ -186,4 +198,4 @@ pyinstaller build.spec
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖文本匹配、漏识别局部补齐、重复副歌顺序、纯中文回退、缓存校验和对轴报告。
+测试覆盖文本匹配、漏识别局部补齐、重复副歌顺序、纯中文回退、缓存校验、对轴报告、Python 环境选择和 GUI 日志精简规则。

@@ -1,26 +1,46 @@
 #!/usr/bin/env python3
-"""
-subtitle_sync_gui.py
-====================
-subtitle_sync 的图形界面版本  v2.0
-现代深色主题  ·  自动 CJK 字体适配  ·  中日双语支持
-"""
+"""Subtitle Sync 的 PySide6 桌面界面。"""
 
-import sys
-import os
+from __future__ import annotations
+
 import json
+import os
 import re
 import shutil
-import threading
 import subprocess
+import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
-import tkinter as tk
-import tkinter.font as tkfont
-from tkinter import ttk, filedialog, messagebox
 
-# ── Windows UTF-8 修复 ────────────────────────────────────────────────────────
+from PySide6.QtCore import QObject, QSettings, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont, QPalette
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QSplitter,
+    QStyleFactory,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+
 if sys.platform == "win32":
     for stream in (sys.stdout, sys.stderr):
         if stream is not None:
@@ -29,15 +49,14 @@ if sys.platform == "win32":
             except Exception:
                 pass
 
-# ── 路径解析（兼容 PyInstaller 打包）─────────────────────────────────────────
+
 if getattr(sys, "frozen", False):
-    # PyInstaller 单文件模式：优先用 exe 同目录的 subtitle_sync.py（方便更新）
     EXE_DIR = Path(sys.executable).parent
     external_script = EXE_DIR / "subtitle_sync.py"
     if external_script.exists():
         APP_DIR = EXE_DIR
     elif hasattr(sys, "_MEIPASS"):
-        APP_DIR = Path(sys._MEIPASS)   # 回退到打包内置版本
+        APP_DIR = Path(sys._MEIPASS)
     else:
         APP_DIR = EXE_DIR
 else:
@@ -57,6 +76,62 @@ PYTHON_MODULES = (
     "torch",
 )
 
+VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".m4v"}
+LYRIC_EXTENSIONS = {".txt", ".lrc"}
+STAGE_PROGRESS = {1: 5, 2: 14, 3: 24, 4: 38, 5: 78, 6: 88, 7: 95}
+
+THEMES = {
+    "light": {
+        "window": "#f4f5f7",
+        "surface": "#ffffff",
+        "surface_alt": "#f8f9fa",
+        "border": "#d8dce2",
+        "text": "#20242a",
+        "muted": "#68707b",
+        "accent": "#18794e",
+        "accent_hover": "#11663f",
+        "accent_soft": "#e7f4ed",
+        "success": "#18794e",
+        "warning": "#a15c00",
+        "error": "#c53929",
+        "selection": "#cce9da",
+    },
+    "dark": {
+        "window": "#111315",
+        "surface": "#1a1d20",
+        "surface_alt": "#202428",
+        "border": "#34393f",
+        "text": "#eef0f2",
+        "muted": "#a0a7af",
+        "accent": "#46b97a",
+        "accent_hover": "#58c98b",
+        "accent_soft": "#173728",
+        "success": "#55c98a",
+        "warning": "#e7a63a",
+        "error": "#ef6a61",
+        "selection": "#24563b",
+    },
+}
+
+
+class _MessageBoxAdapter:
+    """保留简洁的调用接口，也方便无界面测试替换。"""
+
+    @staticmethod
+    def showinfo(title: str, text: str) -> None:
+        QMessageBox.information(None, title, text)
+
+    @staticmethod
+    def showwarning(title: str, text: str) -> None:
+        QMessageBox.warning(None, title, text)
+
+    @staticmethod
+    def showerror(title: str, text: str) -> None:
+        QMessageBox.critical(None, title, text)
+
+
+messagebox = _MessageBoxAdapter()
+
 
 def _creation_flags() -> int:
     return subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -73,11 +148,12 @@ def _candidate_pythons() -> list[tuple[str, str, int]]:
     if APP_DIR.name.lower() == "release":
         project_roots.append(APP_DIR.parent)
     for root in project_roots:
-        if sys.platform == "win32":
-            path = root / ".venv" / "Scripts" / "python.exe"
-        else:
-            path = root / ".venv" / "bin" / "python"
-        candidates.append((str(path), "项目 .venv", 90))
+        executable = (
+            root / ".venv" / "Scripts" / "python.exe"
+            if sys.platform == "win32"
+            else root / ".venv" / "bin" / "python"
+        )
+        candidates.append((str(executable), "项目 .venv", 90))
 
     if not getattr(sys, "frozen", False):
         candidates.append((sys.executable, "当前 Python", 80))
@@ -176,7 +252,7 @@ def _requirements_path() -> Path:
 
 
 def _find_python(required_modules: set[str]) -> tuple[dict, list[dict]]:
-    """探测所有 Python，选择真正具备当前模式依赖的解释器。"""
+    """探测所有 Python，选择具备当前处理模式依赖的解释器。"""
     probes = [
         _probe_python(path, source, priority)
         for path, source, priority in _candidate_pythons()
@@ -188,7 +264,8 @@ def _find_python(required_modules: set[str]) -> tuple[dict, list[dict]]:
     checked = []
     for probe in probes:
         missing = [
-            module for module in sorted(required_modules)
+            module
+            for module in sorted(required_modules)
             if not probe.get("modules", {}).get(module, False)
         ]
         version = ".".join(map(str, probe.get("version") or [])) or "不可用"
@@ -198,9 +275,9 @@ def _find_python(required_modules: set[str]) -> tuple[dict, list[dict]]:
     requirements = _requirements_path()
     best_path = probes[0]["path"] if probes else "python"
     raise RuntimeError(
-        "没有找到满足当前处理模式依赖的 Python。\n\n"
+        "没有找到可用的 Python 环境。\n\n"
         + ("已检查：\n" + "\n".join(checked) + "\n\n" if checked else "")
-        + "可在专用环境中安装依赖：\n"
+        + "安装所需组件：\n"
         + f'"{best_path}" -m pip install -r "{requirements}"'
     )
 
@@ -213,537 +290,810 @@ def _write_json(path: Path, payload: dict) -> None:
     os.replace(temporary, path)
 
 
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  字体检测                                                                  ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
-
-def _detect_cjk_font() -> str:
-    """检测系统最佳 CJK 字体，优先选中文渲染好的。"""
-    # 创建临时根窗口（tkfont.families 需要 root 存在）
-    root = tk.Tk()
-    root.withdraw()
-    try:
-        available = set(tkfont.families(root=root))
-    finally:
-        root.destroy()
-
-    candidates = [
-        "Microsoft YaHei UI",    # Win 中文 UI 优化版 ⬅ 最佳中文渲染
-        "Microsoft YaHei",
-        "Noto Sans SC",          # Google 思源黑体（简体）
-        "Yu Gothic UI",          # Win 日文 UI
-        "Meiryo UI",
-        "Noto Sans JP",
-        "SimHei",
-        "MS UI Gothic",
-    ]
-    for f in candidates:
-        if f in available:
-            return f
-    return "Segoe UI"
+def classify_dropped_paths(paths: list[str]) -> dict[str, str]:
+    """从拖入的路径中找出第一个视频、歌词和目录。"""
+    result: dict[str, str] = {}
+    for raw_path in paths:
+        path = Path(raw_path)
+        if path.is_dir() and "directory" not in result:
+            result["directory"] = str(path)
+        elif path.suffix.casefold() in VIDEO_EXTENSIONS and "video" not in result:
+            result["video"] = str(path)
+        elif path.suffix.casefold() in LYRIC_EXTENSIONS and "lyrics" not in result:
+            result["lyrics"] = str(path)
+    return result
 
 
-def _detect_mono_font() -> str:
-    """检测系统最佳等宽字体。"""
-    root = tk.Tk()
-    root.withdraw()
-    try:
-        available = set(tkfont.families(root=root))
-    finally:
-        root.destroy()
-    candidates = [
-        "Cascadia Code",
-        "Cascadia Mono",
-        "JetBrains Mono",
-        "Consolas",
-        "Courier New",
-    ]
-    for f in candidates:
-        if f in available:
-            return f
-    return "Consolas"
+def parse_runtime_line(raw_line: str) -> dict | None:
+    """把后端的详细输出压缩成界面需要的阶段和简短记录。"""
+    line = raw_line.strip()
+    if not line or not line.strip("─═-"):
+        return None
+
+    stage_match = re.match(r"^\[(\d+)/7\]\s*(.+?)(?:\.\.\.)?$", line)
+    if stage_match:
+        stage = int(stage_match.group(1))
+        return {
+            "kind": "stage",
+            "stage": stage,
+            "progress": STAGE_PROGRESS.get(stage, 0),
+            "message": stage_match.group(2).strip(),
+        }
+
+    segment_match = re.match(r"^\[(\d{3})\]\s+\d+(?:\.\d+)?s\s*[→-]", line)
+    if segment_match:
+        return {"kind": "recognition", "count": int(segment_match.group(1))}
+
+    if line.startswith("仍在处理") or "已运行" in line and line.startswith("⏳"):
+        return None
+    if line.startswith(("运行时间:", "Python:", "Python 来源:", "命令:")):
+        return None
+
+    replacements = {
+        "▶": "",
+        "✅": "",
+        "❌": "错误：",
+        "⚠️": "注意：",
+        "♻️": "",
+        "📄": "",
+        "📊": "",
+        "📁": "",
+        "💡": "说明：",
+        "⏳": "",
+    }
+    cleaned = line
+    for source, target in replacements.items():
+        cleaned = cleaned.replace(source, target)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    if cleaned.startswith("处理:"):
+        return {"kind": "log", "message": "文件：" + cleaned.removeprefix("处理:").strip()}
+    if cleaned.startswith("[") and "words:" in cleaned:
+        return None
+
+    useful_prefixes = (
+        "检测到",
+        "复用 Whisper",
+        "已有 Whisper",
+        "Whisper 识别完成",
+        "Whisper 转录缓存",
+        "使用设备:",
+        "文本锚点:",
+        "英文锚点",
+        "对轴模式:",
+        "SRT 文件",
+        "对轴报告",
+        "文本匹配覆盖率:",
+        "英文锚点覆盖率:",
+        "完成",
+        "对轴完成",
+        "字幕烧入完成",
+        "错误：",
+        "注意：",
+    )
+    useful_error_fragments = (
+        "No module named",
+        "ModuleNotFoundError",
+        "FileNotFoundError",
+        "CUDA out of memory",
+    )
+    if cleaned.startswith(useful_prefixes) or any(
+        fragment in cleaned for fragment in useful_error_fragments
+    ):
+        return {"kind": "log", "message": cleaned}
+    return None
 
 
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  配色方案  ——  现代 Slate 深色主题                                        ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
+class PathLineEdit(QLineEdit):
+    pathDropped = Signal(str)
 
-C = {
-    "bg":       "#0b1120",   # 最深背景
-    "surface":  "#151d2e",   # 卡片底色
-    "border":   "#1e2d45",   # 边框
-    "accent":   "#6366f1",   # 靛蓝主色
-    "accent2":  "#4f46e5",   # 靛蓝深色
-    "text":     "#e2e8f0",   # 主文字
-    "dim":      "#7c8798",   # 次要文字
-    "green":    "#34d399",   # 成功
-    "yellow":   "#fbbf24",   # 警告
-    "red":      "#f87171",   # 错误
-    "entry_bg": "#0f172a",   # 输入框底色
-    "log_bg":   "#070c16",   # 日志底色
-    "white":    "#ffffff",
-}
+    def __init__(self, *, directories: bool = False, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.directories = directories
+        self.setAcceptDrops(True)
+        self.setClearButtonEnabled(True)
 
-# 全局字体（启动时注入）
-FONT_CJK  = _detect_cjk_font()
-FONT_MONO = _detect_mono_font()
-
-F = {
-    "title":  (FONT_CJK, 13, "bold"),   # 15→13
-    "h2":     (FONT_CJK, 10, "bold"),   # 11→10
-    "body":   (FONT_CJK, 9),            # 10→9
-    "small":  (FONT_CJK, 8),            # 9→8
-    "mono":   (FONT_MONO, 9),
-    "btn":    (FONT_CJK, 10, "bold"),   # 11→10
-}
-
-
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  UI 组件                                                                   ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
-
-class ModernButton(tk.Button):
-    """现代扁平按钮：圆角感 + hover 效果。"""
-    def __init__(self, parent, text, style="primary", command=None, **kw):
-        if style == "primary":
-            bg, fg, hover_bg = C["accent"], C["white"], C["accent2"]
-        elif style == "ghost":
-            bg, fg, hover_bg = C["surface"], C["dim"], C["border"]
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
         else:
-            bg, fg, hover_bg = style, C["white"], style
+            super().dragEnterEvent(event)
 
-        super().__init__(
-            parent, text=text,
-            font=F["btn"],
-            bg=bg, fg=fg,
-            activebackground=hover_bg, activeforeground=fg,
-            relief="flat",
-            bd=0, padx=18, pady=6,   # 22/8 → 18/6
-            cursor="hand2",
-            command=command,
-            **kw,
+    def dropEvent(self, event: QDropEvent) -> None:
+        local_paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
+        path = next(
+            (
+                value
+                for value in local_paths
+                if Path(value).is_dir() == self.directories
+            ),
+            "",
         )
-
-
-class FileRow(tk.Frame):
-    """文件选择行：标签 + 输入框 + 浏览按钮。"""
-    def __init__(self, parent, label, var, filetypes=None, is_dir=False,
-                 is_save=False, is_video=False, placeholder="", app=None):
-        super().__init__(parent, bg=C["surface"])
-        self.app = app
-        self.var = var
-        self.is_dir = is_dir
-        self.is_save = is_save
-        self.is_video = is_video
-        self.filetypes = filetypes or []
-        self.columnconfigure(1, weight=1)
-
-        # 标签
-        tk.Label(self, text=label, font=F["body"],
-                 bg=C["surface"], fg=C["dim"], width=10, anchor="e"
-                 ).grid(row=0, column=0, sticky="e", padx=(0, 10), pady=3)
-
-        # 输入框
-        self.entry = tk.Entry(
-            self, textvariable=var, font=F["small"],
-            bg=C["entry_bg"], fg=C["text"],
-            insertbackground=C["accent"],
-            relief="flat", bd=0,
-        )
-        self.entry.grid(row=0, column=1, sticky="ew", pady=3, ipady=3)   # 5→3
-        self.entry.configure(highlightthickness=1, highlightbackground=C["border"],
-                             highlightcolor=C["accent"])
-
-        if placeholder:
-            self._add_placeholder(placeholder)
-
-        # 浏览按钮
-        tk.Button(
-            self, text="浏览", font=F["small"],
-            bg=C["border"], fg=C["text"],
-            activebackground=C["accent"], activeforeground=C["white"],
-            relief="flat", bd=0, padx=14, pady=5,
-            cursor="hand2",
-            command=self._browse,
-        ).grid(row=0, column=2, padx=(8, 0), pady=5)
-
-    def _add_placeholder(self, text):
-        self._placeholder = text
-        def on_focus_in(e):
-            if not self.var.get():
-                self.entry.config(fg=C["text"])
-        def on_focus_out(e):
-            pass
-        self.entry.bind("<FocusIn>", on_focus_in)
-        self.entry.bind("<FocusOut>", on_focus_out)
-
-    def _browse(self):
-        path = ""
-        if self.is_dir:
-            path = filedialog.askdirectory()
-        elif self.is_save:
-            path = filedialog.asksaveasfilename(
-                defaultextension=".mp4", filetypes=self.filetypes)
-        else:
-            path = filedialog.askopenfilename(filetypes=self.filetypes)
-
         if path:
-            self.var.set(path)
-            # ★ 仅视频行触发自动推断
-            if self.app and self.is_video:
-                self.app._on_video_selected(Path(path))
+            self.setText(path)
+            self.pathDropped.emit(path)
+            event.acceptProposedAction()
+        else:
+            super().dropEvent(event)
 
 
-class SegmentedControl(tk.Frame):
-    """分段控制器：iOS 风格的 pill 按钮组。"""
-    def __init__(self, parent, var, options, command=None):
-        super().__init__(parent, bg=C["bg"])
-        self.var = var
-        self.buttons = []
+class DropArea(QFrame):
+    filesDropped = Signal(list)
 
-        inner = tk.Frame(self, bg=C["surface"])
-        inner.pack()
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("dropArea")
+        self.setProperty("dragActive", False)
+        self.setAcceptDrops(True)
+        self.setMinimumHeight(82)
 
-        for i, (text, val) in enumerate(options):
-            btn = tk.Button(
-                inner, text=text, font=F["body"],
-                relief="flat", bd=0, padx=18, pady=6,
-                cursor="hand2",
-                command=lambda v=val: self._select(v, command),
-            )
-            btn.pack(side="left")
-            self.buttons.append((btn, val))
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 13, 16, 13)
+        layout.setSpacing(3)
+        title = QLabel("将视频和歌词拖到这里")
+        title.setObjectName("dropTitle")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        note = QLabel("也可以在下方分别选择文件")
+        note.setObjectName("mutedLabel")
+        note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+        layout.addWidget(note)
 
-        self._update_style()
+    def _set_drag_active(self, active: bool) -> None:
+        self.setProperty("dragActive", active)
+        self.style().unpolish(self)
+        self.style().polish(self)
 
-    def _select(self, val, command):
-        self.var.set(val)
-        self._update_style()
-        if command:
-            command()
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            self._set_drag_active(True)
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
 
-    def _update_style(self):
-        cur = self.var.get()
-        for btn, val in self.buttons:
-            if val == cur:
-                btn.config(bg=C["accent"], fg=C["white"],
-                           activebackground=C["accent2"], activeforeground=C["white"])
-            else:
-                btn.config(bg=C["surface"], fg=C["dim"],
-                           activebackground=C["border"], activeforeground=C["text"])
+    def dragLeaveEvent(self, event) -> None:
+        self._set_drag_active(False)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        self._set_drag_active(False)
+        paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
+        if paths:
+            self.filesDropped.emit(paths)
+            event.acceptProposedAction()
 
 
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  主应用                                                                     ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
+class AppSignals(QObject):
+    output = Signal(str)
+    status = Signal(str, str)
+    message = Signal(str, str, str)
+    runningChanged = Signal(bool)
 
-class App(tk.Tk):
+
+class App(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.title("Subtitle Sync  —  日语歌曲中文字幕自动对轴")
-        self.configure(bg=C["bg"])
-        self.resizable(True, True)
+        self.setWindowTitle("Subtitle Sync")
+        self.setMinimumSize(720, 560)
+        self.resize(900, 720)
 
-        print(f"  GUI 字体: CJK={FONT_CJK}  |  Mono={FONT_MONO}")
-
-        # ── 状态变量 ──
-        self.video_var      = tk.StringVar()
-        self.lyrics_var     = tk.StringVar()
-        self.output_var     = tk.StringVar()
-        self.mode_var       = tk.StringVar(value="single")
-        self.no_vad_var     = tk.BooleanVar(value=False)
-        self.no_burn_var    = tk.BooleanVar(value=False)
-        self.refresh_var    = tk.BooleanVar(value=False)
-        self.audio_source_var = tk.StringVar(value="vocals")
-        self.video_dir_var  = tk.StringVar()
-        self.lyrics_dir_var = tk.StringVar()
-        self.output_dir_var = tk.StringVar()
-        self.running        = False
+        self.running = False
+        self._started_monotonic = 0.0
+        self._theme_mode = "system"
+        self._colors = THEMES["light"]
+        self._settings = QSettings("SubtitleSync", "SubtitleSync")
+        self._signals = AppSignals()
+        self._signals.output.connect(self._receive_process_output)
+        self._signals.status.connect(self._apply_status)
+        self._signals.message.connect(self._display_message)
+        self._signals.runningChanged.connect(self._apply_running_state)
 
         self._build_ui()
-        self._center_window(680, 500)
 
-    # ── 自适应屏幕（兼容 DPI 缩放）──────────────────────────────────────────
-    def _center_window(self, w, h):
-        self.update_idletasks()
-        sw = self.winfo_screenwidth()    # 物理像素
-        sh = self.winfo_screenheight()   # 物理像素
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(1000)
+        self._elapsed_timer.timeout.connect(self._update_elapsed)
 
-        # ★ DPI 缩放修正：geometry() 使用逻辑像素，需换算
-        #    125% 缩放 → scale=1.25 → 700 逻辑像素 = 875 物理像素
-        try:
-            dpi_scale = float(self.tk.call("tk", "scaling"))
-        except Exception:
-            dpi_scale = 1.0
+        saved_theme = self._settings.value("appearance/theme", "system")
+        index = self.theme_combo.findData(saved_theme)
+        self.theme_combo.setCurrentIndex(index if index >= 0 else 0)
+        self._theme_mode = self.theme_combo.currentData()
+        self._apply_theme()
 
-        # 窗口逻辑高度上限 = (屏幕物理高度 - 任务栏等140px) / 缩放比
-        max_h = int((sh - 140) / dpi_scale)
-        max_w = int((sw - 40) / dpi_scale)
+        hints = QApplication.styleHints()
+        if hasattr(hints, "colorSchemeChanged"):
+            hints.colorSchemeChanged.connect(self._on_system_theme_changed)
 
-        w = min(w, max_w)
-        h = min(h, max_h)
-        x = int((sw / dpi_scale - w) // 2)
-        y = int((sh / dpi_scale - h) // 2)
-        self.geometry(f"{w}x{h}+{x}+{y}")
-        self.minsize(min(w - 40, 580), min(h - 60, 380))
+    def _build_ui(self) -> None:
+        central = QWidget()
+        central.setObjectName("central")
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-    def _build_ui(self):
-        # ── 标题栏 ──
-        header = tk.Frame(self, bg=C["surface"], pady=10)
-        header.pack(fill="x")
-        tk.Label(
-            header,
-            text="🎬  字幕自动对轴工具",
-            font=F["title"], bg=C["surface"], fg=C["text"]
-        ).pack()
-        tk.Label(
-            header,
-            text="Demucs 人声分离  →  Whisper 识别  →  FFmpeg 硬字幕烧入",
-            font=F["small"], bg=C["surface"], fg=C["dim"]
-        ).pack(pady=(1, 0))
+        header = QFrame()
+        header.setObjectName("header")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(24, 15, 24, 14)
+        header_layout.setSpacing(16)
 
-        # ── 模式切换 ──
-        seg_frame = tk.Frame(self, bg=C["bg"], pady=8)
-        seg_frame.pack(fill="x")
-        self.mode_ctrl = SegmentedControl(
-            seg_frame, self.mode_var,
-            [("单文件", "single"), ("批量处理", "batch")],
-            command=self._on_mode_change,
+        title_box = QVBoxLayout()
+        title_box.setSpacing(1)
+        title = QLabel("字幕对轴")
+        title.setObjectName("appTitle")
+        subtitle = QLabel("日语歌曲中文字幕时间轴")
+        subtitle.setObjectName("mutedLabel")
+        title_box.addWidget(title)
+        title_box.addWidget(subtitle)
+        header_layout.addLayout(title_box)
+        header_layout.addStretch()
+
+        theme_label = QLabel("外观")
+        theme_label.setObjectName("mutedLabel")
+        self.theme_combo = QComboBox()
+        self.theme_combo.setObjectName("themeCombo")
+        self.theme_combo.addItem("跟随系统", "system")
+        self.theme_combo.addItem("浅色", "light")
+        self.theme_combo.addItem("深色", "dark")
+        self.theme_combo.setMinimumWidth(112)
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_selected)
+        header_layout.addWidget(theme_label)
+        header_layout.addWidget(self.theme_combo)
+        root.addWidget(header)
+
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.setObjectName("mainSplitter")
+        splitter.setChildrenCollapsible(False)
+        root.addWidget(splitter, 1)
+
+        form_scroll = QScrollArea()
+        form_scroll.setObjectName("formScroll")
+        form_scroll.setWidgetResizable(True)
+        form_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        form_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        form_scroll.setMinimumHeight(285)
+        form_content = QWidget()
+        form_layout = QVBoxLayout(form_content)
+        form_layout.setContentsMargins(24, 18, 24, 16)
+        form_layout.setSpacing(14)
+        form_scroll.setWidget(form_content)
+
+        self.mode_tabs = QTabWidget()
+        self.mode_tabs.setDocumentMode(True)
+        self.mode_tabs.addTab(self._build_single_page(), "单文件")
+        self.mode_tabs.addTab(self._build_batch_page(), "批量处理")
+        form_layout.addWidget(self.mode_tabs)
+        form_layout.addWidget(self._build_options_card())
+        form_layout.addStretch()
+        splitter.addWidget(form_scroll)
+        splitter.addWidget(self._build_log_panel())
+        splitter.setSizes([390, 230])
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+
+        footer = QFrame()
+        footer.setObjectName("footer")
+        footer_layout = QVBoxLayout(footer)
+        footer_layout.setContentsMargins(24, 11, 24, 13)
+        footer_layout.setSpacing(8)
+
+        status_row = QHBoxLayout()
+        self.status_label = QLabel("等待开始")
+        self.status_label.setObjectName("statusLabel")
+        self.status_label.setProperty("kind", "idle")
+        self.elapsed_label = QLabel("")
+        self.elapsed_label.setObjectName("mutedLabel")
+        status_row.addWidget(self.status_label)
+        status_row.addStretch()
+        status_row.addWidget(self.elapsed_label)
+        footer_layout.addLayout(status_row)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setFixedHeight(6)
+        footer_layout.addWidget(self.progress_bar)
+
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
+        self.open_logs_btn = QPushButton("打开日志目录")
+        self.open_logs_btn.clicked.connect(self._open_log_directory)
+        action_row.addWidget(self.open_logs_btn)
+        action_row.addStretch()
+        self.start_btn = QPushButton("开始处理")
+        self.start_btn.setObjectName("primaryButton")
+        self.start_btn.setMinimumWidth(124)
+        self.start_btn.clicked.connect(self._start)
+        action_row.addWidget(self.start_btn)
+        footer_layout.addLayout(action_row)
+        root.addWidget(footer)
+
+    def _build_single_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 10, 0, 4)
+        layout.setSpacing(11)
+
+        file_row = QHBoxLayout()
+        file_row.setSpacing(11)
+        drop_area = DropArea()
+        drop_area.filesDropped.connect(self._on_files_dropped)
+        drop_area.setMinimumWidth(205)
+        drop_area.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        file_row.addWidget(drop_area, 1)
+
+        card = QFrame()
+        card.setObjectName("card")
+        grid = QGridLayout(card)
+        grid.setContentsMargins(16, 14, 16, 14)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(10)
+        grid.setColumnStretch(1, 1)
+
+        self.video_edit = PathLineEdit()
+        self.video_edit.setPlaceholderText("选择视频文件")
+        self.video_edit.pathDropped.connect(lambda value: self._on_video_selected(Path(value)))
+        self.lyrics_edit = PathLineEdit()
+        self.lyrics_edit.setPlaceholderText("选择 UTF-8 歌词文本")
+        self.output_edit = PathLineEdit()
+        self.output_edit.setPlaceholderText("不填写时自动命名")
+
+        self._add_path_row(grid, 0, "视频", self.video_edit, self._browse_video)
+        self._add_path_row(grid, 1, "歌词", self.lyrics_edit, self._browse_lyrics)
+        self._add_path_row(grid, 2, "输出", self.output_edit, self._browse_output)
+        file_row.addWidget(card, 3)
+        layout.addLayout(file_row)
+        return page
+
+    def _build_batch_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 10, 0, 4)
+        layout.setSpacing(10)
+
+        note = QLabel("视频与歌词按文件名对应。目录也可以直接拖入输入框。")
+        note.setObjectName("mutedLabel")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        card = QFrame()
+        card.setObjectName("card")
+        grid = QGridLayout(card)
+        grid.setContentsMargins(16, 14, 16, 14)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(10)
+        grid.setColumnStretch(1, 1)
+
+        self.video_dir_edit = PathLineEdit(directories=True)
+        self.video_dir_edit.setPlaceholderText("包含视频的目录")
+        self.lyrics_dir_edit = PathLineEdit(directories=True)
+        self.lyrics_dir_edit.setPlaceholderText("包含歌词的目录")
+        self.output_dir_edit = PathLineEdit(directories=True)
+        self.output_dir_edit.setPlaceholderText("不填写时使用视频目录下的 output")
+
+        self._add_path_row(grid, 0, "视频目录", self.video_dir_edit, lambda: self._browse_dir(self.video_dir_edit))
+        self._add_path_row(grid, 1, "歌词目录", self.lyrics_dir_edit, lambda: self._browse_dir(self.lyrics_dir_edit))
+        self._add_path_row(grid, 2, "输出目录", self.output_dir_edit, lambda: self._browse_dir(self.output_dir_edit))
+        layout.addWidget(card)
+        layout.addStretch()
+        return page
+
+    def _add_path_row(self, grid: QGridLayout, row: int, label: str, edit: QLineEdit, callback) -> None:
+        label_widget = QLabel(label)
+        label_widget.setObjectName("fieldLabel")
+        label_widget.setMinimumWidth(64)
+        button = QPushButton("选择")
+        button.setObjectName("pathButton")
+        button.setFixedWidth(62)
+        button.clicked.connect(callback)
+        grid.addWidget(label_widget, row, 0)
+        grid.addWidget(edit, row, 1)
+        grid.addWidget(button, row, 2)
+
+    def _build_options_card(self) -> QWidget:
+        card = QFrame()
+        card.setObjectName("card")
+        grid = QGridLayout(card)
+        grid.setContentsMargins(16, 13, 16, 13)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(9)
+
+        heading = QLabel("处理设置")
+        heading.setObjectName("sectionTitle")
+        grid.addWidget(heading, 0, 0, 1, 4)
+
+        source_label = QLabel("识别音源")
+        source_label.setObjectName("fieldLabel")
+        self.audio_source_combo = QComboBox()
+        self.audio_source_combo.addItem("分离人声（较慢）", "vocals")
+        self.audio_source_combo.addItem("原始音频（较快）", "original")
+        self.audio_source_combo.setToolTip(
+            "分离人声会先去掉大部分伴奏，通常更适合歌曲识别，但处理时间更长。\n"
+            "原始音频会直接识别视频中的混音。"
         )
-        self.mode_ctrl.pack()
+        grid.addWidget(source_label, 1, 0)
+        grid.addWidget(self.audio_source_combo, 1, 1)
 
-        # ── 文件选择卡片 ──
-        card_outer = tk.Frame(self, bg=C["bg"])
-        card_outer.pack(fill="x", padx=24, pady=(0, 4))
-        card = tk.Frame(card_outer, bg=C["surface"])
-        card.pack(fill="x")
+        self.no_burn_cb = QCheckBox("仅生成 SRT")
+        self.no_burn_cb.setToolTip("生成 SRT 和对轴报告，不重新编码视频。识别步骤仍会运行。")
+        self.refresh_cb = QCheckBox("重新识别")
+        self.refresh_cb.setToolTip("忽略已有 Whisper 缓存，重新提取音频并识别。")
+        self.no_vad_cb = QCheckBox("禁用 VAD")
+        self.no_vad_cb.setToolTip("保留所有音频区间。通常无需开启。")
+        grid.addWidget(self.no_burn_cb, 1, 2)
+        grid.addWidget(self.refresh_cb, 1, 3)
+        grid.addWidget(self.no_vad_cb, 2, 2)
+        grid.setColumnStretch(1, 1)
+        return card
 
-        # 单文件模式
-        self.single_frame = tk.Frame(card, bg=C["surface"])
-        self.single_frame.pack(fill="x", padx=16, pady=(10, 2))
-        FileRow(self.single_frame, "视频文件", self.video_var,
-                [("视频文件", "*.mp4 *.mkv *.avi *.mov *.flv *.webm *.m4v")],
-                is_video=True, app=self).pack(fill="x", pady=2)
-        FileRow(self.single_frame, "歌词文件", self.lyrics_var,
-                [("文本文件", "*.txt")],
-                app=self).pack(fill="x", pady=2)
-        FileRow(self.single_frame, "输出文件", self.output_var,
-                [("MP4 视频", "*.mp4")], is_save=True,
-                placeholder="留空 → 自动命名",
-                app=self).pack(fill="x", pady=2)
+    def _build_log_panel(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("logPanel")
+        panel.setMinimumHeight(115)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(24, 10, 24, 12)
+        layout.setSpacing(7)
 
-        # 批量模式（初始隐藏）
-        self.batch_frame = tk.Frame(card, bg=C["surface"])
-        FileRow(self.batch_frame, "视频目录", self.video_dir_var,
-                is_dir=True, app=self).pack(fill="x", pady=2)
-        FileRow(self.batch_frame, "歌词目录", self.lyrics_dir_var,
-                is_dir=True, app=self).pack(fill="x", pady=2)
-        FileRow(self.batch_frame, "输出目录", self.output_dir_var,
-                is_dir=True, placeholder="留空 → video-dir/output",
-                app=self).pack(fill="x", pady=2)
+        header = QHBoxLayout()
+        title = QLabel("运行记录")
+        title.setObjectName("sectionTitle")
+        clear_btn = QPushButton("清空")
+        clear_btn.setObjectName("quietButton")
+        clear_btn.clicked.connect(self._clear_log)
+        header.addWidget(title)
+        header.addStretch()
+        header.addWidget(clear_btn)
+        layout.addLayout(header)
 
-        # 提示标签
-        tk.Label(
-            card, font=F["small"], bg=C["surface"], fg=C["yellow"],
-            text="💡  歌词格式：纯中文 / 逐行日|中 / 中文段+日文段  —  自动检测",
-        ).pack(anchor="w", padx=16, pady=(0, 4))
+        self.log_text = QPlainTextEdit()
+        self.log_text.setObjectName("logText")
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumBlockCount(500)
+        self.log_text.setPlaceholderText("处理阶段和输出文件会显示在这里")
+        layout.addWidget(self.log_text, 1)
+        return panel
 
-        source_row = tk.Frame(card, bg=C["surface"])
-        source_row.pack(fill="x", padx=16, pady=(0, 8))
-        tk.Label(
-            source_row, text="识别音源", font=F["small"],
-            bg=C["surface"], fg=C["dim"],
-        ).pack(side="left", padx=(0, 8))
-        SegmentedControl(
-            source_row,
-            self.audio_source_var,
-            [("Demucs 人声", "vocals"), ("原始音频", "original")],
-        ).pack(side="left")
+    def _on_theme_selected(self) -> None:
+        if not hasattr(self, "theme_combo"):
+            return
+        self._theme_mode = self.theme_combo.currentData() or "system"
+        self._settings.setValue("appearance/theme", self._theme_mode)
+        self._apply_theme()
 
-        # ── 日志区域 ──
-        log_outer = tk.Frame(self, bg=C["bg"])
-        log_outer.pack(fill="both", expand=True, padx=24, pady=(0, 4))
-        log_card = tk.Frame(log_outer, bg=C["surface"])
-        log_card.pack(fill="both", expand=True)
+    def _on_system_theme_changed(self, _scheme) -> None:
+        if self._theme_mode == "system":
+            self._apply_theme()
 
-        tk.Label(log_card, text="运行日志", font=F["h2"],
-                 bg=C["surface"], fg=C["text"]
-                 ).pack(anchor="w", padx=14, pady=(8, 2))
+    def _effective_theme(self) -> str:
+        if self._theme_mode in {"light", "dark"}:
+            return self._theme_mode
+        scheme = QApplication.styleHints().colorScheme()
+        return "dark" if scheme == Qt.ColorScheme.Dark else "light"
 
-        log_inner = tk.Frame(log_card, bg=C["log_bg"])
-        log_inner.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+    def _apply_theme(self) -> None:
+        application = QApplication.instance()
+        if application is None:
+            return
+        colors = THEMES[self._effective_theme()]
+        self._colors = colors
 
-        self.log_text = tk.Text(
-            log_inner, font=F["mono"], bg=C["log_bg"], fg=C["green"],
-            insertbackground=C["green"], relief="flat", wrap="word",
-            state="disabled", bd=0, padx=8, pady=6,
+        palette = QPalette()
+        palette.setColor(QPalette.ColorRole.Window, QColor(colors["window"]))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor(colors["text"]))
+        palette.setColor(QPalette.ColorRole.Base, QColor(colors["surface_alt"]))
+        palette.setColor(QPalette.ColorRole.AlternateBase, QColor(colors["surface"]))
+        palette.setColor(QPalette.ColorRole.Text, QColor(colors["text"]))
+        palette.setColor(QPalette.ColorRole.Button, QColor(colors["surface"]))
+        palette.setColor(QPalette.ColorRole.ButtonText, QColor(colors["text"]))
+        palette.setColor(QPalette.ColorRole.Highlight, QColor(colors["selection"]))
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor(colors["text"]))
+        application.setPalette(palette)
+        application.setStyleSheet(self._style_sheet(colors))
+
+    @staticmethod
+    def _style_sheet(c: dict[str, str]) -> str:
+        return f"""
+            * {{
+                font-family: "Microsoft YaHei UI", "Segoe UI";
+                font-size: 13px;
+                color: {c['text']};
+            }}
+            QMainWindow, QWidget#central, QScrollArea#formScroll,
+            QScrollArea#formScroll > QWidget > QWidget {{
+                background: {c['window']};
+            }}
+            QFrame#header, QFrame#footer {{
+                background: {c['surface']};
+                border: 0;
+            }}
+            QFrame#header {{ border-bottom: 1px solid {c['border']}; }}
+            QFrame#footer {{ border-top: 1px solid {c['border']}; }}
+            QLabel#appTitle {{ font-size: 20px; font-weight: 650; }}
+            QLabel#sectionTitle, QLabel#dropTitle {{ font-weight: 650; }}
+            QLabel#mutedLabel, QLabel#fieldLabel {{ color: {c['muted']}; }}
+            QLabel#statusLabel {{ font-weight: 600; }}
+            QLabel#statusLabel[kind="success"] {{ color: {c['success']}; }}
+            QLabel#statusLabel[kind="warning"] {{ color: {c['warning']}; }}
+            QLabel#statusLabel[kind="error"] {{ color: {c['error']}; }}
+            QFrame#card {{
+                background: {c['surface']};
+                border: 1px solid {c['border']};
+                border-radius: 9px;
+            }}
+            QFrame#dropArea {{
+                background: {c['surface_alt']};
+                border: 1px dashed {c['border']};
+                border-radius: 9px;
+            }}
+            QFrame#dropArea[dragActive="true"] {{
+                background: {c['accent_soft']};
+                border: 1px solid {c['accent']};
+            }}
+            QFrame#logPanel {{
+                background: {c['surface']};
+                border-top: 1px solid {c['border']};
+            }}
+            QLineEdit, QComboBox, QPlainTextEdit {{
+                background: {c['surface_alt']};
+                border: 1px solid {c['border']};
+                border-radius: 6px;
+                padding: 7px 9px;
+                selection-background-color: {c['selection']};
+            }}
+            QLineEdit:focus, QComboBox:focus, QPlainTextEdit:focus {{
+                border-color: {c['accent']};
+            }}
+            QComboBox {{ padding-right: 24px; }}
+            QComboBox::drop-down {{ border: 0; width: 24px; }}
+            QComboBox QAbstractItemView {{
+                background: {c['surface']};
+                border: 1px solid {c['border']};
+                selection-background-color: {c['selection']};
+                outline: 0;
+            }}
+            QPlainTextEdit#logText {{
+                font-family: "Cascadia Mono", "Consolas";
+                font-size: 12px;
+                padding: 8px;
+            }}
+            QPushButton {{
+                background: {c['surface_alt']};
+                border: 1px solid {c['border']};
+                border-radius: 6px;
+                padding: 7px 13px;
+            }}
+            QPushButton:hover {{ border-color: {c['accent']}; }}
+            QPushButton:pressed {{ background: {c['accent_soft']}; }}
+            QPushButton:disabled {{ color: {c['muted']}; border-color: {c['border']}; }}
+            QPushButton#primaryButton {{
+                color: white;
+                background: {c['accent']};
+                border-color: {c['accent']};
+                font-weight: 650;
+                padding: 8px 18px;
+            }}
+            QPushButton#primaryButton:hover {{ background: {c['accent_hover']}; }}
+            QPushButton#quietButton {{
+                color: {c['muted']};
+                background: transparent;
+                border: 0;
+                padding: 4px 7px;
+            }}
+            QTabWidget::pane {{ border: 0; }}
+            QTabBar::tab {{
+                color: {c['muted']};
+                background: transparent;
+                border: 0;
+                border-bottom: 2px solid transparent;
+                padding: 8px 18px;
+                margin-right: 4px;
+            }}
+            QTabBar::tab:selected {{
+                color: {c['text']};
+                border-bottom-color: {c['accent']};
+                font-weight: 650;
+            }}
+            QCheckBox {{ spacing: 7px; }}
+            QCheckBox::indicator {{ width: 16px; height: 16px; }}
+            QCheckBox::indicator:unchecked {{
+                background: {c['surface_alt']};
+                border: 1px solid {c['border']};
+                border-radius: 3px;
+            }}
+            QCheckBox::indicator:checked {{
+                background: {c['accent']};
+                border: 1px solid {c['accent']};
+                border-radius: 3px;
+            }}
+            QProgressBar {{
+                background: {c['border']};
+                border: 0;
+                border-radius: 3px;
+            }}
+            QProgressBar::chunk {{ background: {c['accent']}; border-radius: 3px; }}
+            QSplitter::handle {{ background: {c['border']}; height: 1px; }}
+            QScrollBar:vertical {{
+                background: transparent; width: 10px; margin: 1px;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {c['border']}; min-height: 28px; border-radius: 4px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+        """
+
+    def _browse_video(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择视频",
+            "",
+            "视频文件 (*.mp4 *.mkv *.avi *.mov *.flv *.webm *.m4v)",
         )
-        self.log_text.pack(fill="both", expand=True, side="left")
+        if path:
+            self.video_edit.setText(path)
+            self._on_video_selected(Path(path))
 
-        scroll = ttk.Scrollbar(log_inner, command=self.log_text.yview)
-        scroll.pack(side="right", fill="y")
-        self.log_text.configure(yscrollcommand=scroll.set)
+    def _browse_lyrics(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "选择歌词", "", "歌词文本 (*.txt *.lrc)")
+        if path:
+            self.lyrics_edit.setText(path)
 
-        # ── 底部操作栏 ──
-        bar = tk.Frame(self, bg=C["surface"], pady=8)
-        bar.pack(fill="x", padx=24, pady=(0, 10))
-        bar_inner = tk.Frame(bar, bg=C["surface"])
-        bar_inner.pack(fill="x", padx=10)
+    def _browse_output(self) -> None:
+        initial = self.output_edit.text().strip()
+        path, _ = QFileDialog.getSaveFileName(self, "输出文件", initial, "MP4 视频 (*.mp4)")
+        if path:
+            self.output_edit.setText(path)
 
-        self.start_btn = ModernButton(bar_inner, "▶  开始处理", "primary",
-                                       command=self._start)
-        self.start_btn.pack(side="left")
+    def _browse_dir(self, target: QLineEdit) -> None:
+        path = QFileDialog.getExistingDirectory(self, "选择目录", target.text().strip())
+        if path:
+            target.setText(path)
 
-        ModernButton(bar_inner, "清空日志", "ghost",
-                     command=self._clear_log).pack(side="left", padx=10)
+    def _on_files_dropped(self, paths: list[str]) -> None:
+        classified = classify_dropped_paths(paths)
+        if video := classified.get("video"):
+            self.video_edit.setText(video)
+            self._on_video_selected(Path(video))
+        if lyrics := classified.get("lyrics"):
+            self.lyrics_edit.setText(lyrics)
+        if not {"video", "lyrics"}.intersection(classified):
+            self._append_log("未找到支持的视频或歌词文件")
 
-        self.no_vad_cb = tk.Checkbutton(
-            bar_inner, text=" 禁用 VAD ", variable=self.no_vad_var,
-            font=F["body"], bg=C["surface"], fg=C["dim"],
-            selectcolor=C["bg"], activebackground=C["surface"],
-            activeforeground=C["accent"],
-            relief="flat", bd=0, padx=6, cursor="hand2",
-        )
-        self.no_vad_cb.pack(side="left")
-
-        self.no_burn_cb = tk.Checkbutton(
-            bar_inner, text=" 仅生成SRT ", variable=self.no_burn_var,
-            font=F["small"], bg=C["surface"], fg=C["dim"],
-            selectcolor=C["bg"], activebackground=C["surface"],
-            activeforeground=C["accent"], relief="flat", bd=0,
-            cursor="hand2",
-        )
-        self.no_burn_cb.pack(side="left")
-
-        self.refresh_cb = tk.Checkbutton(
-            bar_inner, text=" 重新识别 ", variable=self.refresh_var,
-            font=F["small"], bg=C["surface"], fg=C["dim"],
-            selectcolor=C["bg"], activebackground=C["surface"],
-            activeforeground=C["accent"], relief="flat", bd=0,
-            cursor="hand2",
-        )
-        self.refresh_cb.pack(side="left")
-
-        self.status_label = tk.Label(
-            bar_inner, text="就绪", font=F["body"],
-            bg=C["surface"], fg=C["dim"]
-        )
-        self.status_label.pack(side="right")
-
-    # ──────────────────────────────────────────────────────────────────────────
-    #  交互逻辑
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def _on_video_selected(self, path: Path):
-        """选视频后自动推断输出 & 歌词路径。"""
-        self.output_var.set(str(path.parent / f"{path.stem}_subtitled{path.suffix}"))
+    def _on_video_selected(self, path: Path) -> None:
+        self.output_edit.setText(str(path.parent / f"{path.stem}_subtitled{path.suffix}"))
         candidate = path.with_suffix(".txt")
-        if candidate.exists() and not self.lyrics_var.get():
-            self.lyrics_var.set(str(candidate))
+        if candidate.exists() and not self.lyrics_edit.text().strip():
+            self.lyrics_edit.setText(str(candidate))
 
-    def _on_mode_change(self):
-        mode = self.mode_var.get()
-        if mode == "single":
-            self.batch_frame.pack_forget()
-            self.single_frame.pack(fill="x", padx=16, pady=(10, 2))
-        else:
-            self.single_frame.pack_forget()
-            self.batch_frame.pack(fill="x", padx=16, pady=(10, 2))
-
-    # ──────────────────────────────────────────────────────────────────────────
-    #  运行控制
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def _start(self):
+    def _start(self) -> None:
         if self.running:
             return
+        if not SYNC_SCRIPT.exists():
+            messagebox.showerror("缺少核心脚本", f"未找到：\n{SYNC_SCRIPT}")
+            return
 
-        mode = self.mode_var.get()
-        audio_source = self.audio_source_var.get()
+        mode = "single" if self.mode_tabs.currentIndex() == 0 else "batch"
+        config = {
+            "mode": mode,
+            "audio_source": self.audio_source_combo.currentData(),
+            "no_vad": self.no_vad_cb.isChecked(),
+            "no_burn": self.no_burn_cb.isChecked(),
+            "refresh": self.refresh_cb.isChecked(),
+        }
+
+        if mode == "single":
+            video = self.video_edit.text().strip()
+            lyrics = self.lyrics_edit.text().strip()
+            if not video:
+                messagebox.showwarning("缺少视频", "请选择视频文件。")
+                return
+            if not Path(video).is_file():
+                messagebox.showwarning("视频不存在", video)
+                return
+            if not lyrics:
+                messagebox.showwarning("缺少歌词", "请选择歌词文件。")
+                return
+            if not Path(lyrics).is_file():
+                messagebox.showwarning("歌词不存在", lyrics)
+                return
+            config.update(
+                video=video,
+                lyrics=lyrics,
+                output=self.output_edit.text().strip(),
+            )
+        else:
+            video_dir = self.video_dir_edit.text().strip()
+            lyrics_dir = self.lyrics_dir_edit.text().strip()
+            if not video_dir or not Path(video_dir).is_dir():
+                messagebox.showwarning("视频目录无效", "请选择包含视频的目录。")
+                return
+            if not lyrics_dir or not Path(lyrics_dir).is_dir():
+                messagebox.showwarning("歌词目录无效", "请选择包含歌词的目录。")
+                return
+            config.update(
+                video_dir=video_dir,
+                lyrics_dir=lyrics_dir,
+                output_dir=self.output_dir_edit.text().strip(),
+            )
+
+        self.running = True
+        self._apply_running_state(True)
+        self.progress_bar.setValue(2)
+        self._apply_status("检查运行环境", "working")
+        self._append_log("开始处理")
+        self._started_monotonic = time.monotonic()
+        self.elapsed_label.setText("已运行 00:00")
+        self._elapsed_timer.start()
+
+        threading.Thread(
+            target=self._prepare_and_run,
+            args=(config,),
+            daemon=True,
+        ).start()
+
+    def _prepare_and_run(self, config: dict) -> None:
         required_modules = {"faster_whisper", "rapidfuzz"}
-        if audio_source == "vocals":
+        if config["audio_source"] == "vocals":
             required_modules.add("demucs")
+
         try:
             selected_python, python_probes = _find_python(required_modules)
         except RuntimeError as error:
             LOG_DIR.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now().astimezone().isoformat()
             LATEST_LOG.write_text(
-                f"[{timestamp}] Python 环境预检失败\n{error}\n",
+                f"[{timestamp}] Python 环境检查失败\n{error}\n",
                 encoding="utf-8",
             )
-            _write_json(LATEST_DIAGNOSTIC, {
-                "started_at": timestamp,
-                "status": "preflight_failed",
-                "required_modules": sorted(required_modules),
-                "error": str(error),
-                "log_path": str(LATEST_LOG),
-            })
-            messagebox.showerror("Python 环境不完整", str(error))
+            _write_json(
+                LATEST_DIAGNOSTIC,
+                {
+                    "started_at": timestamp,
+                    "status": "preflight_failed",
+                    "required_modules": sorted(required_modules),
+                    "error": str(error),
+                    "log_path": str(LATEST_LOG),
+                },
+            )
+            self._log(f"错误：运行环境检查失败\n{error}\n")
+            self._set_status("运行环境不可用", "error")
+            self._show_message("error", "运行环境不可用", str(error))
+            self._processing_finished()
             return
 
         python_exe = selected_python["path"]
-
-        if mode == "single":
-            video  = self.video_var.get().strip()
-            lyrics = self.lyrics_var.get().strip()
-            output = self.output_var.get().strip()
-
-            if not video:
-                messagebox.showwarning("缺少文件", "请选择视频文件")
-                return
-            if not lyrics:
-                messagebox.showwarning("缺少文件", "请选择歌词文件")
-                return
-
-            cmd = [python_exe, "-u", str(SYNC_SCRIPT),
-                   "--video", video, "--lyrics", lyrics]
-            if output:
-                cmd += ["--output", output]
+        cmd = [python_exe, "-u", str(SYNC_SCRIPT)]
+        if config["mode"] == "single":
+            cmd += ["--video", config["video"], "--lyrics", config["lyrics"]]
+            if config["output"]:
+                cmd += ["--output", config["output"]]
         else:
-            vdir = self.video_dir_var.get().strip()
-            ldir = self.lyrics_dir_var.get().strip()
-            odir = self.output_dir_var.get().strip()
+            cmd += [
+                "--batch",
+                "--video-dir",
+                config["video_dir"],
+                "--lyrics-dir",
+                config["lyrics_dir"],
+            ]
+            if config["output_dir"]:
+                cmd += ["--output-dir", config["output_dir"]]
 
-            if not vdir:
-                messagebox.showwarning("缺少目录", "请选择视频目录")
-                return
-            if not ldir:
-                messagebox.showwarning("缺少目录", "请选择歌词目录")
-                return
+        cmd += ["--audio-source", config["audio_source"]]
+        if config["no_vad"]:
+            cmd.append("--no-vad")
+        if config["no_burn"]:
+            cmd.append("--no-burn")
+        if config["refresh"]:
+            cmd.append("--refresh-transcript")
 
-            cmd = [python_exe, "-u", str(SYNC_SCRIPT),
-                   "--batch", "--video-dir", vdir, "--lyrics-dir", ldir]
-            if odir:
-                cmd += ["--output-dir", odir]
-
-        cmd += ["--audio-source", audio_source]
-        if self.no_vad_var.get():
-            cmd += ["--no-vad"]
-        if self.no_burn_var.get():
-            cmd += ["--no-burn"]
-        if self.refresh_var.get():
-            cmd += ["--refresh-transcript"]
-
-        # 启动前检查 subtitle_sync.py 是否存在
-        if not SYNC_SCRIPT.exists():
-            messagebox.showerror(
-                "缺少脚本",
-                f"未找到核心脚本:\n{SYNC_SCRIPT}\n\n请确保 subtitle_sync.py 与本程序在同一目录。"
-            )
-            return
-
-        self.running = True
-        self.start_btn.config(text="⏳  处理中...", state="disabled",
-                              bg=C["dim"], activebackground=C["dim"])
-        self._set_status("处理中...", C["yellow"])
         run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
-        run_context = {
+        context = {
             "run_id": run_id,
             "started_at": datetime.now().astimezone().isoformat(),
             "status": "starting",
-            "mode": mode,
-            "audio_source": audio_source,
+            "mode": config["mode"],
+            "audio_source": config["audio_source"],
             "required_modules": sorted(required_modules),
             "selected_python": selected_python,
             "python_candidates": python_probes,
@@ -751,26 +1101,16 @@ class App(tk.Tk):
             "log_path": str(LATEST_LOG),
             "run_log_path": str(LOG_DIR / f"run-{run_id}.log"),
         }
-        self._log(
-            f"\n{'─'*52}\n▶ 开始处理\n{'─'*52}\n"
-            f"Python: {python_exe}\n"
-            f"自动日志: {LATEST_LOG}\n"
-        )
+        self._run_cmd(cmd, context)
 
-        threading.Thread(
-            target=self._run_cmd,
-            args=(cmd, run_context),
-            daemon=True,
-        ).start()
-
-    def _run_cmd(self, cmd, run_context):
+    def _run_cmd(self, cmd: list[str], run_context: dict) -> None:
         no_burn = "--no-burn" in cmd
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         run_log_path = Path(run_context["run_log_path"])
         exit_code = None
         status = "failed"
 
-        def update_diagnostics(**changes):
+        def update_diagnostics(**changes) -> None:
             run_context.update(changes)
             _write_json(LATEST_DIAGNOSTIC, run_context)
             _write_json(run_log_path.with_suffix(".json"), run_context)
@@ -782,7 +1122,7 @@ class App(tk.Tk):
             ):
                 emit_lock = threading.Lock()
 
-                def emit(text):
+                def emit(text: str) -> None:
                     with emit_lock:
                         latest_log.write(text)
                         latest_log.flush()
@@ -796,50 +1136,45 @@ class App(tk.Tk):
                     f"Python 来源: {run_context['selected_python']['source']}\n"
                     f"识别音源: {run_context['audio_source']}\n"
                     f"命令: {subprocess.list2cmdline(cmd)}\n"
-                    f"{'─'*60}\n"
+                    f"{'─' * 60}\n"
                 )
                 emit(header)
                 update_diagnostics(status="running")
 
-                proc = subprocess.Popen(
+                process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    text=True, encoding="utf-8", errors="replace",
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     bufsize=1,
+                    creationflags=_creation_flags(),
                 )
-                def pump_output():
-                    if proc.stdout is not None:
-                        with proc.stdout:
-                            for line in proc.stdout:
-                                emit(line)
+                if process.stdout is not None:
+                    with process.stdout:
+                        for line in process.stdout:
+                            emit(line)
+                exit_code = process.wait()
 
-                reader = threading.Thread(target=pump_output, daemon=True)
-                reader.start()
-                started_waiting = time.monotonic()
-                next_heartbeat = 30
-                while proc.poll() is None:
-                    reader.join(timeout=1)
-                    elapsed = int(time.monotonic() - started_waiting)
-                    if elapsed >= next_heartbeat:
-                        emit(f"\n⏳ 仍在处理，已运行 {elapsed} 秒...\n")
-                        next_heartbeat += 30
-                reader.join(timeout=5)
-                proc.wait()
-                exit_code = proc.returncode
-                if proc.returncode == 0:
+                if exit_code == 0:
                     status = "completed"
-                    emit(f"\n{'─'*52}\n✅ 全部完成！\n{'─'*52}\n")
-                    self._set_status("✅ 完成", C["green"])
-                    message = "SRT 与对轴报告已生成！" if no_burn else "字幕烧入完成！"
-                    self.after(0, lambda: messagebox.showinfo("完成", message))
+                    emit("\n处理完成\n")
+                    self._set_status("处理完成", "success")
+                    message = "SRT 和对轴报告已生成。" if no_burn else "字幕视频已生成。"
+                    self._show_message("info", "处理完成", message)
                 else:
                     status = "failed"
-                    emit(f"\n❌ 脚本退出，返回码: {proc.returncode}\n")
-                    self._set_status("❌ 出错", C["red"])
-        except Exception as e:
+                    emit(f"\n错误：处理程序退出，返回码 {exit_code}\n")
+                    self._set_status("处理失败", "error")
+                    self._show_message(
+                        "error",
+                        "处理失败",
+                        "处理没有完成。界面中保留了错误摘要，完整信息可在日志目录中查看。",
+                    )
+        except Exception as error:
             status = "launch_failed"
-            error_text = f"\n❌ 启动失败: {e}\n"
+            error_text = f"\n错误：无法启动处理程序：{error}\n"
             self._log(error_text)
             try:
                 with open(LATEST_LOG, "a", encoding="utf-8") as handle:
@@ -848,36 +1183,111 @@ class App(tk.Tk):
                     handle.write(error_text)
             except OSError:
                 pass
-            run_context["error"] = str(e)
-            self._set_status("❌ 出错", C["red"])
+            run_context["error"] = str(error)
+            self._set_status("无法启动", "error")
+            self._show_message("error", "无法启动", str(error))
         finally:
-            update_diagnostics(
-                status=status,
-                exit_code=exit_code,
-                finished_at=datetime.now().astimezone().isoformat(),
-            )
-            self.running = False
-            self.after(0, lambda: self.start_btn.config(
-                text="▶  开始处理", state="normal",
-                bg=C["accent"], activebackground=C["accent2"]))
+            try:
+                update_diagnostics(
+                    status=status,
+                    exit_code=exit_code,
+                    finished_at=datetime.now().astimezone().isoformat(),
+                )
+            finally:
+                self._processing_finished()
 
-    def _log(self, text):
-        def _append():
-            self.log_text.config(state="normal")
-            self.log_text.insert("end", text)
-            self.log_text.see("end")
-            self.log_text.config(state="disabled")
-        self.after(0, _append)
+    def _log(self, text: str) -> None:
+        self._signals.output.emit(text)
 
-    def _clear_log(self):
-        self.log_text.config(state="normal")
-        self.log_text.delete("1.0", "end")
-        self.log_text.config(state="disabled")
+    def _set_status(self, text: str, kind: str) -> None:
+        self._signals.status.emit(text, kind)
 
-    def _set_status(self, text, color):
-        self.after(0, lambda: self.status_label.config(text=text, fg=color))
+    def _show_message(self, kind: str, title: str, text: str) -> None:
+        self._signals.message.emit(kind, title, text)
+
+    def _processing_finished(self) -> None:
+        self.running = False
+        self._signals.runningChanged.emit(False)
+
+    def _receive_process_output(self, text: str) -> None:
+        for line in text.splitlines():
+            event = parse_runtime_line(line)
+            if event is None:
+                continue
+            if event["kind"] == "stage":
+                self.progress_bar.setValue(event["progress"])
+                self._apply_status(event["message"], "working")
+                self._append_log(event["message"])
+            elif event["kind"] == "recognition":
+                self._apply_status(f"语音识别 · {event['count']} 个片段", "working")
+            elif event["kind"] == "log":
+                self._append_log(event["message"])
+
+    def _append_log(self, message: str) -> None:
+        timestamp = datetime.now().strftime("%H:%M")
+        self.log_text.appendPlainText(f"{timestamp}  {message}")
+        scrollbar = self.log_text.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def _clear_log(self) -> None:
+        self.log_text.clear()
+
+    def _apply_status(self, text: str, kind: str) -> None:
+        self.status_label.setText(text)
+        self.status_label.setProperty("kind", kind)
+        self.status_label.style().unpolish(self.status_label)
+        self.status_label.style().polish(self.status_label)
+        if kind == "success":
+            self.progress_bar.setValue(100)
+
+    def _apply_running_state(self, running: bool) -> None:
+        self.start_btn.setEnabled(not running)
+        self.start_btn.setText("处理中" if running else "开始处理")
+        self.mode_tabs.setEnabled(not running)
+        self.audio_source_combo.setEnabled(not running)
+        self.no_burn_cb.setEnabled(not running)
+        self.refresh_cb.setEnabled(not running)
+        self.no_vad_cb.setEnabled(not running)
+        if not running:
+            self._elapsed_timer.stop()
+
+    def _display_message(self, kind: str, title: str, text: str) -> None:
+        if kind == "error":
+            messagebox.showerror(title, text)
+        elif kind == "warning":
+            messagebox.showwarning(title, text)
+        else:
+            messagebox.showinfo(title, text)
+
+    def _update_elapsed(self) -> None:
+        elapsed = max(0, int(time.monotonic() - self._started_monotonic))
+        minutes, seconds = divmod(elapsed, 60)
+        hours, minutes = divmod(minutes, 60)
+        formatted = f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
+        self.elapsed_label.setText(f"已运行 {formatted}")
+
+    def _open_log_directory(self) -> None:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            os.startfile(LOG_DIR)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(LOG_DIR)])
+        else:
+            subprocess.Popen(["xdg-open", str(LOG_DIR)])
+
+
+def main() -> int:
+    application = QApplication(sys.argv)
+    application.setApplicationName("Subtitle Sync")
+    application.setOrganizationName("SubtitleSync")
+    fusion = QStyleFactory.create("Fusion")
+    if fusion is not None:
+        application.setStyle(fusion)
+    application.setFont(QFont("Microsoft YaHei UI", 9))
+    window = App()
+    window.show()
+    return application.exec()
 
 
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    raise SystemExit(main())
