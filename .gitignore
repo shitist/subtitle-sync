@@ -1,0 +1,32 @@
+__pycache__/
+*.py[cod]
+*.pyd
+
+.venv/
+venv/
+env/
+
+build/
+dist/
+*.spec.bak
+
+# Generated media and subtitle artifacts
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.flv
+*.webm
+*.m4v
+*.wav
+*.mp3
+*.srt
+*.alignment.json
+*.whisper.json
+
+# Reproducible packaged binary
+release/*.exe
+
+.pytest_cache/
+.coverage
+htmlcov/
