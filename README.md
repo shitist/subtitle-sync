@@ -1,132 +1,165 @@
 # 日语歌曲中文字幕自动对轴工具
 
-自动将纯文本中文歌词与日语歌曲视频对轴并烧入硬字幕。
+从日语歌曲视频提取音频，识别日文歌声，并把逐行中文字幕生成 SRT 或烧入视频。
 
----
+## 对轴方式
 
-## 工作原理
+推荐使用逐行双语歌词：
 
-```
-MP4 视频
-  ↓  FFmpeg        提取音频
-  ↓  Demucs        人声分离（去除背景音乐，大幅提升识别准确率）
-  ↓  Whisper       日语识别，获取逐句时间轴
-  ↓  对轴算法      时间轴映射到中文歌词
-  ↓  FFmpeg        硬字幕烧入
-  ↓
-带中文字幕的 MP4
+```text
+世界の終わりで|在世界终结之处
+生まれた光|诞生的光芒
+君を探して|寻找着你
 ```
 
----
+处理流程：
+
+```text
+视频 → FFmpeg 提取音频 → Demucs 人声分离（可选）
+     → faster-whisper large-v3 逐词识别
+     → 日文歌词与识别文本进行顺序受限匹配
+     → 高分匹配作为时间锚点，漏识别行在相邻锚点间局部补齐
+     → SRT + 对轴报告 → 可选 FFmpeg 硬字幕烧入
+```
+
+有日文原文时，程序会实际比较歌词与 Whisper 识别文字，不再按照片段数量全局均分。没有日文原文时仍可处理纯中文歌词，但会明确标记为低置信度的时间比例回退。
 
 ## 环境要求
 
-### 系统依赖（需手动安装）
+- Python 3.10+
+- FFmpeg（推荐加入系统 `PATH`）
+- 首次使用 `large-v3` 时需要下载约 3 GB 模型
 
-| 工具 | 说明 | 下载 |
-|------|------|------|
-| **Python 3.10+** | 运行脚本 | https://python.org |
-| **FFmpeg** | 音视频处理 | https://ffmpeg.org/download.html |
-
-> ⚠️ **FFmpeg 安装后需添加到系统 PATH**，在 PowerShell 中运行 `ffmpeg -version` 确认。
-
-### Python 依赖
+安装 Python 依赖：
 
 ```powershell
 pip install -r requirements.txt
 ```
 
-> 首次运行时 Whisper 会自动下载 large-v3 模型（约 **3GB**），请确保磁盘空间充足。
+有 NVIDIA 显卡时需要安装与本机 CUDA 环境匹配的 PyTorch/CTranslate2 运行库。没有可用 GPU 时会使用 CPU `int8`。
 
-### GPU 加速（可选，推荐）
+## 歌词格式
 
-有 NVIDIA 显卡时处理速度可提升 **5~10 倍**，请到 https://pytorch.org/get-started/locally/ 获取对应 CUDA 版本的安装命令。
+### 逐行日中双语（精确模式，推荐）
 
----
+使用 `|` 或 Tab 分隔：
+
+```text
+世界の終わりで|在世界终结之处
+生まれた光|诞生的光芒
+```
+
+### 中文段＋日文段
+
+```text
+在世界终结之处
+诞生的光芒
+世界の終わりで
+生まれた光
+```
+
+两段行数相同时会按行配对。行数不一致时，缺少日文原文的行将通过相邻文本锚点补齐并列入待检查项。
+
+### 纯中文（低置信度回退）
+
+```text
+在世界终结之处
+诞生的光芒
+```
+
+纯中文无法与日语识别文本直接比较，只能利用声音片段边界估算时间。
 
 ## 使用方法
 
-### 单文件处理
+### 图形界面
 
 ```powershell
-# 基本用法
+python subtitle_sync_gui.py
+```
+
+界面支持：
+
+- 单文件和批量处理
+- Demucs 人声或原始混合音频
+- 仅生成 SRT，不烧录视频
+- 强制重新运行 Whisper
+- 启用或禁用 VAD
+
+### 单文件
+
+```powershell
 python subtitle_sync.py --video song.mp4 --lyrics song.txt
+```
 
-# 指定输出文件
-python subtitle_sync.py --video song.mp4 --lyrics song.txt --output out.mp4
+先检查字幕和报告，不烧录视频：
 
-# 同时保留 .srt 字幕文件
-python subtitle_sync.py --video song.mp4 --lyrics song.txt --keep-srt
+```powershell
+python subtitle_sync.py --video song.mp4 --lyrics song.txt --no-burn
+```
+
+使用原始混合音频识别，跳过 Demucs：
+
+```powershell
+python subtitle_sync.py --video song.mp4 --lyrics song.txt --audio-source original
+```
+
+忽略已有转录缓存并重新识别：
+
+```powershell
+python subtitle_sync.py --video song.mp4 --lyrics song.txt --refresh-transcript
+```
+
+调整文本锚点最低相似度：
+
+```powershell
+python subtitle_sync.py --video song.mp4 --lyrics song.txt --min-match-score 60
 ```
 
 ### 批量处理
 
-视频文件和歌词文件需**同名**（扩展名不同）：
+视频和歌词文件需要同名、扩展名不同：
 
-```
-videos/
-  song_a.mp4
-  song_b.mp4
-
-lyrics/
-  song_a.txt    ← 对应 song_a.mp4
-  song_b.txt    ← 对应 song_b.mp4
+```text
+videos/song_a.mp4
+lyrics/song_a.txt
 ```
 
 ```powershell
-# 批量处理，输出到 videos/output/
 python subtitle_sync.py --batch --video-dir ./videos --lyrics-dir ./lyrics
-
-# 指定输出目录
-python subtitle_sync.py --batch --video-dir ./videos --lyrics-dir ./lyrics --output-dir ./output
 ```
 
----
+## 输出文件
 
-## 歌词文件格式
+假设输出视频为 `song_subtitled.mp4`：
 
-UTF-8 编码的纯文本文件，**每行一句**（空行自动跳过）：
+| 文件 | 用途 |
+|---|---|
+| `song_subtitled.mp4` | 烧入硬字幕的视频；使用 `--no-burn` 时不生成 |
+| `song_subtitled.srt` | 始终生成的字幕文件 |
+| `song_subtitled.alignment.json` | 每行时间、匹配文字、文本分数、Whisper 词概率、状态和待检查行 |
+| `song_subtitled.whisper.json` | Whisper 原始片段与逐词时间缓存 |
 
+`alignment.json` 中的主要状态：
+
+- `matched`：文本匹配分数较高
+- `low_confidence`：达到锚点阈值，但建议复核
+- `interpolated`：Whisper 漏识别，时间由相邻锚点局部补齐
+- `timing_fallback`：没有日文原文，只能按声音边界估算
+
+修改对轴算法或相似度阈值时可以直接复用 `.whisper.json`，无需重新运行 Demucs 和 Whisper。输入视频、歌词或识别设置变化时缓存会自动失效。
+
+## 打包说明
+
+```powershell
+pyinstaller build.spec
 ```
-这条街的风景
-今天也很美丽
-你的笑容
-在我脑海中回荡
+
+打包后的 `SubtitleSync.exe` 是轻量 GUI 启动器，不内置 Whisper、Demucs 和模型。目标机器仍需安装可用的 Python 3.10+ 及 `requirements.txt` 中的依赖。EXE 会优先使用同目录的 `subtitle_sync.py`，方便更新核心算法。
+
+## 测试
+
+```powershell
+python -m unittest discover -s tests -v
 ```
 
-> **关键**：歌词行数应与日语原文一一对应。行数无需精确匹配——工具会自动按比例合并/拆分片段。
-
----
-
-## 对轴算法说明
-
-| 情况 | 处理方式 |
-|------|---------|
-| Whisper 片段数 == 歌词行数 | 直接 1:1 映射（最理想） |
-| Whisper 片段数 > 歌词行数 | 按比例合并相邻片段 |
-| Whisper 片段数 < 歌词行数 | 将歌词均分到各片段内 |
-
----
-
-## 常见问题
-
-**Q: 时间轴偏差较大怎么办？**  
-A: 可以用 `--keep-srt` 保留 .srt 文件，用 [Aegisub](https://aegisub.org/) 手动微调后再用 FFmpeg 烧入。
-
-**Q: Whisper 识别不准怎么办？**  
-A: 工具已启用 VAD（语音活动检测）过滤静音段。如仍有问题，检查人声分离效果——可在 `work_dir` 中找到 Demucs 输出的 `vocals.wav` 手动试听。
-
-**Q: 支持哪些视频格式？**  
-A: 支持 `.mp4 .mkv .avi .mov .flv .webm .m4v`（批量模式下自动识别）。
-
-**Q: 字体显示问题（方块字）？**  
-A: 默认使用微软雅黑，Windows 系统已自带。Linux/macOS 用户需修改脚本中的 `FontName` 为本地可用字体。
-
----
-
-## 输出说明
-
-| 文件 | 说明 |
-|------|------|
-| `{原文件名}_subtitled.mp4` | 带硬字幕的视频（默认输出） |
-| `{原文件名}.srt` | SRT 字幕文件（使用 `--keep-srt` 时） |
+测试覆盖文本匹配、漏识别局部补齐、重复副歌顺序、纯中文回退、缓存校验和对轴报告。

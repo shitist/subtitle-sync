@@ -1,7 +1,7 @@
 # 日语歌曲中文字幕自动对轴工具 v2.0 — Python 依赖
 
 # Whisper 语音识别（比官方 openai-whisper 快 4x，支持 GPU/CPU）
-faster-whisper>=1.0.0
+faster-whisper>=1.2.1,<2.0
 
 # 人声分离（去除背景音乐，提升 Whisper 识别准确率）
 demucs>=4.0.0

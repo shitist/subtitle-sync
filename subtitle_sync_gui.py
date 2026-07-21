@@ -327,6 +327,9 @@ class App(tk.Tk):
         self.output_var     = tk.StringVar()
         self.mode_var       = tk.StringVar(value="single")
         self.no_vad_var     = tk.BooleanVar(value=False)
+        self.no_burn_var    = tk.BooleanVar(value=False)
+        self.refresh_var    = tk.BooleanVar(value=False)
+        self.audio_source_var = tk.StringVar(value="vocals")
         self.video_dir_var  = tk.StringVar()
         self.lyrics_dir_var = tk.StringVar()
         self.output_dir_var = tk.StringVar()
@@ -418,7 +421,19 @@ class App(tk.Tk):
         tk.Label(
             card, font=F["small"], bg=C["surface"], fg=C["yellow"],
             text="💡  歌词格式：纯中文 / 逐行日|中 / 中文段+日文段  —  自动检测",
-        ).pack(anchor="w", padx=16, pady=(0, 8))
+        ).pack(anchor="w", padx=16, pady=(0, 4))
+
+        source_row = tk.Frame(card, bg=C["surface"])
+        source_row.pack(fill="x", padx=16, pady=(0, 8))
+        tk.Label(
+            source_row, text="识别音源", font=F["small"],
+            bg=C["surface"], fg=C["dim"],
+        ).pack(side="left", padx=(0, 8))
+        SegmentedControl(
+            source_row,
+            self.audio_source_var,
+            [("Demucs 人声", "vocals"), ("原始音频", "original")],
+        ).pack(side="left")
 
         # ── 日志区域 ──
         log_outer = tk.Frame(self, bg=C["bg"])
@@ -465,6 +480,24 @@ class App(tk.Tk):
             relief="flat", bd=0, padx=6, cursor="hand2",
         )
         self.no_vad_cb.pack(side="left")
+
+        self.no_burn_cb = tk.Checkbutton(
+            bar_inner, text=" 仅生成SRT ", variable=self.no_burn_var,
+            font=F["small"], bg=C["surface"], fg=C["dim"],
+            selectcolor=C["bg"], activebackground=C["surface"],
+            activeforeground=C["accent"], relief="flat", bd=0,
+            cursor="hand2",
+        )
+        self.no_burn_cb.pack(side="left")
+
+        self.refresh_cb = tk.Checkbutton(
+            bar_inner, text=" 重新识别 ", variable=self.refresh_var,
+            font=F["small"], bg=C["surface"], fg=C["dim"],
+            selectcolor=C["bg"], activebackground=C["surface"],
+            activeforeground=C["accent"], relief="flat", bd=0,
+            cursor="hand2",
+        )
+        self.refresh_cb.pack(side="left")
 
         self.status_label = tk.Label(
             bar_inner, text="就绪", font=F["body"],
@@ -520,8 +553,6 @@ class App(tk.Tk):
                    "--video", video, "--lyrics", lyrics]
             if output:
                 cmd += ["--output", output]
-            if self.no_vad_var.get():
-                cmd += ["--no-vad"]
         else:
             vdir = self.video_dir_var.get().strip()
             ldir = self.lyrics_dir_var.get().strip()
@@ -538,6 +569,14 @@ class App(tk.Tk):
                    "--batch", "--video-dir", vdir, "--lyrics-dir", ldir]
             if odir:
                 cmd += ["--output-dir", odir]
+
+        cmd += ["--audio-source", self.audio_source_var.get()]
+        if self.no_vad_var.get():
+            cmd += ["--no-vad"]
+        if self.no_burn_var.get():
+            cmd += ["--no-burn"]
+        if self.refresh_var.get():
+            cmd += ["--refresh-transcript"]
 
         # 启动前检查 subtitle_sync.py 是否存在
         if not SYNC_SCRIPT.exists():
@@ -556,6 +595,7 @@ class App(tk.Tk):
         threading.Thread(target=self._run_cmd, args=(cmd,), daemon=True).start()
 
     def _run_cmd(self, cmd):
+        no_burn = "--no-burn" in cmd
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -570,7 +610,8 @@ class App(tk.Tk):
             if proc.returncode == 0:
                 self._log(f"\n{'─'*52}\n✅ 全部完成！\n{'─'*52}\n")
                 self._set_status("✅ 完成", C["green"])
-                self.after(0, lambda: messagebox.showinfo("完成", "字幕烧入完成！"))
+                message = "SRT 与对轴报告已生成！" if no_burn else "字幕烧入完成！"
+                self.after(0, lambda: messagebox.showinfo("完成", message))
             else:
                 self._log(f"\n❌ 脚本退出，返回码: {proc.returncode}\n")
                 self._set_status("❌ 出错", C["red"])
