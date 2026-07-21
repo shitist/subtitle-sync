@@ -7,10 +7,10 @@ subtitle_sync.py
 工作流程:
   1. FFmpeg 提取音频
   2. Demucs 人声分离（去掉背景音乐，提升 Whisper 准确率）
-  3. faster-whisper large-v3 识别日语（支持日文歌词 prompt 引导 + word 级时间戳）
+  3. faster-whisper large-v3 独立识别日语并输出 word 级时间戳
   4. 智能对轴：
      - 若有日文歌词：fuzzy matching（rapidfuzz）日→日匹配，再映射到中文
-     - 若仅中文歌词：动态规划序列对齐 + 按比例分配
+     - 若仅中文歌词：优先使用英文锚点局部对齐，否则低置信度时间回退
   5. FFmpeg 将硬字幕烧入原视频
 
 歌词文件格式（UTF-8）:
@@ -33,7 +33,6 @@ subtitle_sync.py
 """
 
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -56,7 +55,7 @@ if sys.platform == "win32":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-TRANSCRIPT_CACHE_SCHEMA = 1
+TRANSCRIPT_CACHE_SCHEMA = 2
 DEFAULT_MIN_MATCH_SCORE = 55.0
 
 
@@ -166,8 +165,6 @@ def separate_vocals(audio_path: Path, work_dir: Path) -> Path:
 
 def transcribe_audio(
     audio_path: Path,
-    initial_prompt: Optional[str] = None,
-    hotwords: Optional[str] = None,
     use_vad: bool = True,
 ) -> list:
     """
@@ -175,8 +172,6 @@ def transcribe_audio(
 
     参数:
       audio_path:     人声 WAV 文件路径
-      initial_prompt: 短日文提示，引导 Whisper 识别
-      hotwords:       从整首日文歌词抽取的提示词
       use_vad:        是否启用 VAD 静音过滤
 
     返回:
@@ -204,14 +199,6 @@ def transcribe_audio(
         "compression_ratio_threshold": 2.4,   # 放宽压缩比阈值（音乐场景下容忍度更高）
     }
 
-    if initial_prompt:
-        transcribe_kwargs["initial_prompt"] = initial_prompt
-        print(f"    使用日文歌词 prompt（{len(initial_prompt)} 字符）引导识别")
-
-    if hotwords:
-        transcribe_kwargs["hotwords"] = hotwords
-        print(f"    使用全曲歌词 hotwords（{len(hotwords)} 字符）")
-
     if use_vad:
         transcribe_kwargs["vad_filter"] = True
         transcribe_kwargs["vad_parameters"] = dict(
@@ -223,14 +210,7 @@ def transcribe_audio(
     else:
         transcribe_kwargs["vad_filter"] = False
 
-    try:
-        segments_gen, info = model.transcribe(str(audio_path), **transcribe_kwargs)
-    except TypeError as error:
-        if "hotwords" not in transcribe_kwargs:
-            raise
-        print(f"    ⚠️  当前 faster-whisper 不支持 hotwords，已回退: {error}")
-        transcribe_kwargs.pop("hotwords")
-        segments_gen, info = model.transcribe(str(audio_path), **transcribe_kwargs)
+    segments_gen, info = model.transcribe(str(audio_path), **transcribe_kwargs)
 
     segments = []
     for i, seg in enumerate(segments_gen, 1):
@@ -432,8 +412,8 @@ def align_lyrics_to_segments(
     使用日文歌词与 Whisper 识别文本进行单调动态规划匹配。
 
     有日文原文时，匹配逐词文本并将高分结果作为时间锚点；漏识别行只在
-    相邻锚点之间局部补间。没有日文原文时，保留旧的时间比例算法作为
-    低置信度回退。
+    相邻锚点之间局部补间。没有日文原文时，优先提取歌词中的英文/数字
+    作为弱锚点；可用锚点不足时才保留时间比例算法作为低置信度回退。
     """
     lyric_lines = [
         line if isinstance(line, LyricLine) else LyricLine("", str(line))
@@ -448,6 +428,11 @@ def align_lyrics_to_segments(
     if words and japanese_count:
         print(f"    对轴模式: 日文文本动态规划匹配（可匹配 {japanese_count}/{len(lyric_lines)} 行）")
         return _align_with_text(words, lyric_lines, min_match_score)
+
+    if words:
+        latin_aligned = _align_with_latin_anchors(words, lyric_lines, min_match_score)
+        if latin_aligned is not None:
+            return latin_aligned
 
     print("    对轴模式: 仅时间比例回退（无可用于文本匹配的日文歌词）")
     return _align_by_timing(segments, lyric_lines)
@@ -504,10 +489,64 @@ def _similarity(left: str, right: str) -> float:
         return SequenceMatcher(None, left, right).ratio() * 100.0
 
 
+def _normalize_latin_anchor(text: str) -> str:
+    """提取中日混合歌词中可与 Whisper 直接比较的英文和数字。"""
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    return "".join(re.findall(r"[a-z0-9]+", normalized))
+
+
+def _align_with_latin_anchors(
+    words: list[WordTiming],
+    lyric_lines: list[LyricLine],
+    min_match_score: float,
+) -> Optional[list[AlignmentItem]]:
+    """纯中文歌词使用其中的英文/数字短语作为低置信度顺序锚点。"""
+    anchor_lines = [
+        LyricLine(
+            anchor if len(anchor) >= 4 else "",
+            line.zh,
+        )
+        for line in lyric_lines
+        for anchor in [_normalize_latin_anchor(line.zh)]
+    ]
+    anchorable_count = sum(bool(line.ja) for line in anchor_lines)
+    latin_words = [
+        WordTiming(word.start, word.end, anchor, word.probability)
+        for word in words
+        for anchor in [_normalize_latin_anchor(word.text)]
+        if anchor
+    ]
+    if anchorable_count < 2 or len(latin_words) < 2:
+        return None
+
+    anchor_threshold = max(45.0, min_match_score - 10.0)
+    print(
+        f"    对轴模式: 纯中文英文锚点匹配"
+        f"（候选 {anchorable_count}/{len(lyric_lines)} 行）"
+    )
+    aligned = _align_with_text(
+        latin_words,
+        anchor_lines,
+        anchor_threshold,
+        max_span_seconds=5.0,
+    )
+    matched_count = 0
+    for item in aligned:
+        if item.status in {"matched", "low_confidence"}:
+            item.status = "latin_anchor"
+            matched_count += 1
+
+    if matched_count < 2:
+        print("    英文文本锚点不足 2 行，改用时间比例回退。")
+        return None
+    return aligned
+
+
 def _align_with_text(
     words: list[WordTiming],
     lyric_lines: list[LyricLine],
     min_match_score: float,
+    max_span_seconds: Optional[float] = None,
 ) -> list[AlignmentItem]:
     """按歌词顺序将每行日文匹配到连续的 Whisper word span。"""
     line_count = len(lyric_lines)
@@ -560,6 +599,12 @@ def _align_with_text(
             raw_parts: list[str] = []
             for span_size in range(1, max_words + 1):
                 end_index = word_index + span_size
+                if (
+                    max_span_seconds is not None
+                    and words[end_index - 1].end - words[word_index].start
+                    > max_span_seconds
+                ):
+                    break
                 raw_parts.append(words[end_index - 1].text)
                 recognized = "".join(raw_parts)
                 normalized_recognized = _normalize_japanese(recognized)
@@ -854,14 +899,28 @@ def save_alignment_report(
     min_match_score: float,
 ) -> dict:
     """保存逐行匹配依据与置信度，返回摘要。"""
-    matched = [item for item in aligned if item.status in {"matched", "low_confidence"}]
+    matched = [
+        item
+        for item in aligned
+        if item.status in {"matched", "low_confidence", "latin_anchor"}
+    ]
     scores = [item.score for item in matched if item.score is not None]
     word_probabilities = [
         item.word_probability
         for item in matched
         if item.word_probability is not None
     ]
-    mode = "text_dp" if any(item.source_text for item in aligned) else "timing_fallback"
+    if any(item.status == "latin_anchor" for item in aligned):
+        mode = "latin_anchor"
+    elif any(item.source_text for item in aligned):
+        mode = "text_dp"
+    else:
+        mode = "timing_fallback"
+    effective_minimum = (
+        max(45.0, min_match_score - 10.0)
+        if mode == "latin_anchor"
+        else min_match_score
+    )
     summary = {
         "mode": mode,
         "line_count": len(aligned),
@@ -872,7 +931,7 @@ def save_alignment_report(
             round(sum(word_probabilities) / len(word_probabilities), 4)
             if word_probabilities else None
         ),
-        "minimum_match_score": min_match_score,
+        "minimum_match_score": effective_minimum,
         "needs_review": [
             index
             for index, item in enumerate(aligned, 1)
@@ -891,9 +950,10 @@ def save_alignment_report(
         json.dump(payload, handle, ensure_ascii=False, indent=2)
 
     print(f"    对轴报告已生成: {output_path}")
-    if mode == "text_dp":
+    if mode in {"text_dp", "latin_anchor"}:
+        label = "文本匹配" if mode == "text_dp" else "英文锚点"
         print(
-            f"    文本匹配覆盖率: {summary['matched_coverage'] * 100:.1f}%"
+            f"    {label}覆盖率: {summary['matched_coverage'] * 100:.1f}%"
             f"，平均分: {summary['average_match_score'] if scores else 'N/A'}"
         )
     else:
@@ -937,53 +997,30 @@ def burn_subtitles(video_path: Path, srt_path: Path, output_path: Path) -> None:
     _run(cmd, "FFmpeg 烧入字幕")
 
 
-def _build_lyric_hints(lyric_lines: list[LyricLine]) -> tuple[Optional[str], Optional[str]]:
-    """构建短 initial prompt 与覆盖全曲位置的 hotwords。"""
-    japanese = [line.ja.strip() for line in lyric_lines if line.ja.strip()]
-    if not japanese:
-        return None, None
-
-    initial_prompt = ("日语歌曲歌词。" + "。".join(japanese))[:160]
-    if len("。".join(japanese)) <= 240:
-        selected = japanese
-    else:
-        sample_count = min(16, len(japanese))
-        indexes = {
-            round(index * (len(japanese) - 1) / max(sample_count - 1, 1))
-            for index in range(sample_count)
-        }
-        selected = [japanese[index] for index in sorted(indexes)]
-    hotwords = "，".join(selected)[:240]
-    return initial_prompt, hotwords
-
-
-def _file_fingerprint(path: Path, include_hash: bool = False) -> dict:
+def _file_fingerprint(path: Path) -> dict:
     stat = path.stat()
     result = {
         "path": str(path.resolve()),
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
     }
-    if include_hash:
-        result["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
     return result
 
 
 def _transcript_metadata(
     video_path: Path,
-    lyrics_path: Path,
     use_vad: bool,
     audio_source: str,
 ) -> dict:
+    # 识别不再依赖歌词内容；同一音视频设置可在纯中文/双语歌词间复用缓存。
     return {
         "schema_version": TRANSCRIPT_CACHE_SCHEMA,
         "model": "large-v3",
         "language": "ja",
-        "transcription_profile": "lyrics-v1",
+        "transcription_profile": "audio-ja-v2-no-lyric-prompt",
         "use_vad": use_vad,
         "audio_source": audio_source,
         "video": _file_fingerprint(video_path),
-        "lyrics": _file_fingerprint(lyrics_path, include_hash=True),
     }
 
 
@@ -1071,12 +1108,10 @@ def process_single(
 
         _step(1, 7, "加载歌词")
         _ja_prompt, lyric_lines = load_lyrics(lyrics_path)
-        initial_prompt, hotwords = _build_lyric_hints(lyric_lines)
 
         cache_path = output_path.with_suffix(".whisper.json")
         metadata = _transcript_metadata(
             video_path,
-            lyrics_path,
             use_vad=not no_vad,
             audio_source=audio_source,
         )
@@ -1097,8 +1132,6 @@ def process_single(
             _step(4, 7, "Whisper large-v3 日语识别")
             segments = transcribe_audio(
                 transcription_audio,
-                initial_prompt=initial_prompt,
-                hotwords=hotwords,
                 use_vad=not no_vad,
             )
             save_transcript_cache(cache_path, segments, metadata)

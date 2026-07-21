@@ -150,6 +150,28 @@ class TextAlignmentTests(unittest.TestCase):
         self.assertEqual([item.status for item in aligned], ["timing_fallback"] * 2)
         self.assertEqual([item.text for item in aligned], ["第一行", "第二行"])
 
+    def test_chinese_only_uses_ordered_latin_anchors_before_timing_fallback(self):
+        words = [
+            WordTiming(1.0, 1.4, "Start"),
+            WordTiming(1.4, 1.8, "now"),
+            WordTiming(5.0, 5.8, "中间日语"),
+            WordTiming(10.0, 10.5, "Final"),
+            WordTiming(10.5, 11.0, "light"),
+        ]
+        lyrics = [
+            LyricLine("", "Start now"),
+            LyricLine("", "中间的中文字幕"),
+            LyricLine("", "Final light"),
+        ]
+
+        aligned = align_lyrics_to_segments([segment_with_words(words)], lyrics)
+
+        self.assertEqual(aligned[0].status, "latin_anchor")
+        self.assertEqual(aligned[0].start, 1.0)
+        self.assertEqual(aligned[1].status, "interpolated")
+        self.assertEqual(aligned[2].status, "latin_anchor")
+        self.assertEqual(aligned[2].start, 10.0)
+
     def test_low_whisper_probability_is_flagged_for_review(self):
         words = [WordTiming(1.0, 2.0, "正しい歌詞", 0.2)]
         lyrics = [LyricLine("正しい歌詞", "正确歌词")]
@@ -161,6 +183,22 @@ class TextAlignmentTests(unittest.TestCase):
 
 
 class ArtifactTests(unittest.TestCase):
+    def test_transcript_metadata_does_not_depend_on_lyrics_content(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            video = root / "sample.mp4"
+            lyrics_a = root / "a.txt"
+            lyrics_b = root / "b.txt"
+            video.write_bytes(b"same-video")
+            lyrics_a.write_text("纯中文", encoding="utf-8")
+            lyrics_b.write_text("日本語\n\n\n日文", encoding="utf-8")
+
+            metadata_a = _transcript_metadata(video, True, "vocals")
+            metadata_b = _transcript_metadata(video, True, "vocals")
+
+        self.assertEqual(metadata_a, metadata_b)
+        self.assertNotIn("lyrics", metadata_a)
+
     def test_transcript_cache_round_trip_and_metadata_guard(self):
         segments = [SimpleSegment(
             1.0,
@@ -168,7 +206,7 @@ class ArtifactTests(unittest.TestCase):
             "歌詞",
             [WordTiming(1.1, 1.9, "歌詞", 0.9)],
         )]
-        metadata = {"schema_version": 1, "key": "value"}
+        metadata = {"schema_version": 2, "key": "value"}
         with tempfile.TemporaryDirectory() as temp_dir:
             cache = Path(temp_dir) / "sample.whisper.json"
             save_transcript_cache(cache, segments, metadata)
@@ -204,7 +242,7 @@ class ArtifactTests(unittest.TestCase):
                 WordTiming(1.0, 2.0, "一番目", 0.95),
                 WordTiming(3.0, 4.0, "二番目", 0.95),
             ])]
-            metadata = _transcript_metadata(video, lyrics, True, "vocals")
+            metadata = _transcript_metadata(video, True, "vocals")
             save_transcript_cache(cache, segments, metadata)
 
             process_single(video, lyrics, output, no_burn=True)
