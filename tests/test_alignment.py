@@ -11,6 +11,7 @@ from subtitle_sync import (
     _normalize_japanese,
     _transcript_metadata,
     align_lyrics_to_segments,
+    load_lyrics,
     load_transcript_cache,
     process_single,
     save_alignment_report,
@@ -25,6 +26,43 @@ def segment_with_words(words):
         text="".join(word.text for word in words),
         words=words,
     )
+
+
+class LyricsParsingTests(unittest.TestCase):
+    def _load(self, content):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "lyrics.txt"
+            path.write_text(content, encoding="utf-8")
+            return load_lyrics(path)
+
+    def test_double_blank_separates_blocks_when_japanese_starts_with_english(self):
+        prompt, lines = self._load(
+            "中文字幕一\n\n中文字幕二\n中文字幕三\n\n\n"
+            "English source one\nEnglish source two\n日本語三\n"
+        )
+
+        self.assertEqual(
+            [line.zh for line in lines],
+            ["中文字幕一", "中文字幕二", "中文字幕三"],
+        )
+        self.assertEqual(
+            [line.ja for line in lines],
+            ["English source one", "English source two", "日本語三"],
+        )
+        self.assertIn("日本語三", prompt)
+
+    def test_single_blank_is_only_paragraph_spacing(self):
+        prompt, lines = self._load("第一行\n\n第二行\n")
+
+        self.assertEqual(prompt, "")
+        self.assertEqual([line.zh for line in lines], ["第一行", "第二行"])
+
+    def test_legacy_block_without_double_blank_still_uses_kana_boundary(self):
+        prompt, lines = self._load("中文一\n中文二\nにほんご一\nにほんご二\n")
+
+        self.assertEqual([line.zh for line in lines], ["中文一", "中文二"])
+        self.assertEqual([line.ja for line in lines], ["にほんご一", "にほんご二"])
+        self.assertEqual(prompt, "にほんご一。にほんご二")
 
 
 class TextAlignmentTests(unittest.TestCase):

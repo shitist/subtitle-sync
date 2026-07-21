@@ -296,7 +296,8 @@ def load_lyrics(lyrics_path: Path) -> tuple[str, list[LyricLine]]:
       诞生的光芒
     """
     with open(lyrics_path, "r", encoding="utf-8") as f:
-        raw_lines = [ln.strip() for ln in f if ln.strip()]
+        physical_lines = [ln.rstrip("\r\n") for ln in f]
+    raw_lines = [ln.strip() for ln in physical_lines if ln.strip()]
 
     if not raw_lines:
         _die("歌词文件为空")
@@ -308,6 +309,24 @@ def load_lyrics(lyrics_path: Path) -> tuple[str, list[LyricLine]]:
         ja_prompt = "。".join(j for j in ja_list if j)
         print(f"    检测到逐行双语歌词：中文 {len(zh_list)} 行")
         return ja_prompt, [LyricLine(ja, zh) for ja, zh in zip(ja_list, zh_list)]
+
+    # ── 格式 2: 双空行显式分隔中文块 / 日文块 ──
+    # 单个空行常用于歌词分段，因此只把连续两个及以上空行当作块分隔符。
+    explicit_blocks = _split_at_double_blank_line(physical_lines)
+    if explicit_blocks is not None:
+        zh_lines, ja_lines = explicit_blocks
+        ja_prompt = "。".join(ja_lines)
+        print(
+            f"    检测到双空行分隔的中/日歌词："
+            f"中文 {len(zh_lines)} 行 + 日文 {len(ja_lines)} 行"
+        )
+        if len(zh_lines) != len(ja_lines):
+            print(f"    ⚠️  中/日行数不一致，请检查双空行分隔位置。")
+        lyric_lines = [
+            LyricLine(ja_lines[i] if i < len(ja_lines) else "", zh)
+            for i, zh in enumerate(zh_lines)
+        ]
+        return ja_prompt, lyric_lines
 
     # ── 格式 2 vs 3: 假名检测 ──
     kana_flags = [_has_japanese_kana(ln) for ln in raw_lines]
@@ -348,6 +367,31 @@ def load_lyrics(lyrics_path: Path) -> tuple[str, list[LyricLine]]:
         for i, zh in enumerate(zh_lines)
     ]
     return ja_prompt, lyric_lines
+
+
+def _split_at_double_blank_line(
+    physical_lines: list[str],
+) -> Optional[tuple[list[str], list[str]]]:
+    """用连续两个及以上空行分隔中文整块与日文整块。"""
+    index = 0
+    while index < len(physical_lines):
+        if physical_lines[index].strip():
+            index += 1
+            continue
+
+        gap_start = index
+        while index < len(physical_lines) and not physical_lines[index].strip():
+            index += 1
+
+        if index - gap_start < 2:
+            continue
+
+        left = [line.strip() for line in physical_lines[:gap_start] if line.strip()]
+        right = [line.strip() for line in physical_lines[index:] if line.strip()]
+        if left and right:
+            return left, right
+
+    return None
 
 
 def _has_japanese_kana(text: str) -> bool:
