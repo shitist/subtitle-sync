@@ -8,12 +8,11 @@
 
 普通使用者无需下载源码或安装 PySide6：
 
-1. 在本仓库的 **Releases** 页面下载最新版本。
-2. 解压完整压缩包，不要只单独复制 `SubtitleSync.exe`。
-3. 双击 `SubtitleSync.exe` 打开界面。
-4. 拖入视频和歌词，选择模型与处理方式后开始。
+1. 在本仓库的 **Releases** 页面下载 `SubtitleSync.exe`。
+2. 双击 `SubtitleSync.exe` 打开界面，无需安装或解压。
+3. 拖入视频和歌词，选择模型与处理方式后开始。
 
-Release 中的 EXE 已包含图形界面，但不包含 Whisper、Demucs 和语音模型。电脑仍需安装 Python 3.10+ 及 `requirements.txt` 中的识别依赖。第一次使用某个语音模型时会自动联网下载；之后会直接使用本机缓存。
+Release 中的 EXE 已包含图形界面和核心脚本，但不包含 Whisper、Demucs 和语音模型。电脑仍需安装 Python 3.10+ 及识别依赖。第一次使用某个语音模型时会自动联网下载；之后会直接使用本机缓存。
 
 如果运行环境不完整，程序会在处理前列出缺少的组件和安装命令。日常使用不需要通过命令行启动界面。
 
@@ -252,15 +251,15 @@ Subtitle-tool/
 ├─ requirements-gui.txt      源码运行与打包 GUI 的依赖
 ├─ build.spec                PyInstaller 打包配置
 ├─ tests/                    对轴、缓存和 GUI 测试
-├─ release/                  Release 发布包内容
-│  ├─ SubtitleSync.exe       Windows 图形界面程序
-│  ├─ subtitle_sync.py       EXE 优先调用的外置核心脚本
-│  └─ requirements.txt       Release 运行依赖
+├─ release/                  本地 Release 准备目录
+│  ├─ SubtitleSync.exe       可单独发布的 Windows 图形界面程序
+│  ├─ subtitle_sync.py       可选的外置核心脚本
+│  └─ requirements.txt       识别环境依赖清单
 ├─ LICENSE                   MIT License
 └─ README.md                 使用说明
 ```
 
-`build/`、`dist/`、日志、模型缓存和生成的媒体文件属于本地构建或运行产物，不纳入源码仓库。`release/SubtitleSync.exe` 作为 GitHub Release 附件发布。
+`build/`、`dist/`、日志、模型缓存和生成的媒体文件属于本地构建或运行产物，不纳入源码仓库。`release/SubtitleSync.exe` 可以直接作为 GitHub Release 附件发布，不需要制作安装包或压缩包。
 
 ## 打包说明
 
