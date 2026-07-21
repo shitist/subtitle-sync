@@ -1,0 +1,20 @@
+# 日语歌曲中文字幕自动对轴工具 v2.0 — Python 依赖
+
+# Whisper 语音识别（比官方 openai-whisper 快 4x，支持 GPU/CPU）
+faster-whisper>=1.2.1,<2.0
+
+# 人声分离（去除背景音乐，提升 Whisper 识别准确率）
+demucs>=4.0.0
+
+# 日文歌词模糊匹配（中日双语对齐核心依赖）
+rapidfuzz>=3.0.0
+
+# ─────────────────────────────────────────
+# 可选: GPU 加速（如有 NVIDIA 显卡）
+# ─────────────────────────────────────────
+# 安装 CUDA 版 PyTorch（请到 https://pytorch.org/get-started/locally/ 获取适合你 CUDA 版本的命令）
+# 示例 CUDA 12.1:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# FFmpeg 捆绑包
+imageio-ffmpeg>=0.5.0

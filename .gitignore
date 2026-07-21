@@ -30,3 +30,6 @@ release/*.exe
 .pytest_cache/
 .coverage
 htmlcov/
+
+logs/
+*.log

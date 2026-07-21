@@ -85,6 +85,23 @@ python subtitle_sync_gui.py
 - 强制重新运行 Whisper
 - 启用或禁用 VAD
 
+GUI 启动处理前会扫描项目虚拟环境、`PATH` 和 Windows Python Launcher 注册的解释器，并逐一检查 Python 版本及 `faster_whisper`、`rapidfuzz`、`demucs` 等模块。选择 Demucs 人声时，缺少 `demucs` 的解释器不会被采用；没有合格环境时会在提取音频前停止并列出缺失模块。
+
+可使用环境变量 `SUBTITLE_SYNC_PYTHON` 指定专用解释器。指定环境仍须通过版本和依赖检查。
+
+### 自动运行诊断
+
+GUI 会把每次运行的完整输出、实际选中的 Python、候选环境检查结果、命令、退出码和时间自动保存到：
+
+```text
+logs/latest.log
+logs/latest.json
+logs/run-YYYYMMDD-HHMMSS.log
+logs/run-YYYYMMDD-HHMMSS.json
+```
+
+从 `release/SubtitleSync.exe` 启动时，日志位于 `release/logs/`。排查问题时无需复制 GUI 中的输出，直接检查 `latest.log` 和 `latest.json` 即可。
+
 ### 单文件
 
 ```powershell

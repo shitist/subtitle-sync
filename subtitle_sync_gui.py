@@ -8,9 +8,12 @@ subtitle_sync 的图形界面版本  v2.0
 
 import sys
 import os
+import json
+import re
 import shutil
 import threading
 import subprocess
+from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 import tkinter.font as tkfont
@@ -37,55 +40,176 @@ if getattr(sys, "frozen", False):
     else:
         APP_DIR = EXE_DIR
 else:
+    EXE_DIR = Path(__file__).parent
     APP_DIR = Path(__file__).parent
 
 SYNC_SCRIPT = APP_DIR / "subtitle_sync.py"
+LOG_DIR = EXE_DIR / "logs" if getattr(sys, "frozen", False) else APP_DIR / "logs"
+LATEST_LOG = LOG_DIR / "latest.log"
+LATEST_DIAGNOSTIC = LOG_DIR / "latest.json"
+
+PYTHON_MODULES = (
+    "faster_whisper",
+    "demucs",
+    "rapidfuzz",
+    "imageio_ffmpeg",
+    "torch",
+)
 
 
-def _find_python() -> str:
-    """找到可用于运行 subtitle_sync.py 的 Python 解释器。
-    
-    注意：Windows 的 Microsoft Store 版 Python 会在 PATH 中放置存根
-    （如 %LOCALAPPDATA%\\Microsoft\\WindowsApps\\python.exe），
-    这些存根不是真正的 .exe，执行会报 WinError 193，必须跳过。
-    """
-    if getattr(sys, "frozen", False):
-        for name in ["python", "python3", "py"]:
-            found = shutil.which(name)
-            if not found:
-                continue
-            # ★ 跳过 WindowsApps 商店存根（会导致 WinError 193）
-            if "WindowsApps" in found:
-                continue
-            # ★ 验证候选可用（运行 --version 确认）
-            try:
-                r = subprocess.run(
-                    [found, "--version"],
-                    capture_output=True, timeout=5,
-                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-                )
-                if r.returncode == 0:
-                    return found
-            except Exception:
-                continue
+def _creation_flags() -> int:
+    return subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
-        # 回退：尝试系统目录下的 Python Launcher
-        windir = os.environ.get("WINDIR", r"C:\Windows")
-        for candidate in [
-            os.path.join(windir, "py.exe"),
-            os.path.join(windir, "System32", "py.exe"),
-        ]:
-            if os.path.isfile(candidate):
-                return candidate
 
-        raise RuntimeError(
-            "未找到可用的 Python 环境。\n\n"
-            "请从 https://python.org 下载安装 Python 3.10+，\n"
-            "并确保安装时勾选 'Add Python to PATH'。\n\n"
-            "注意：Microsoft Store 版本的 Python 不被支持。"
+def _candidate_pythons() -> list[tuple[str, str, int]]:
+    """列出候选解释器；返回 (路径, 来源, 优先级)。"""
+    candidates: list[tuple[str, str, int]] = []
+    override = os.environ.get("SUBTITLE_SYNC_PYTHON", "").strip()
+    if override:
+        candidates.append((override, "SUBTITLE_SYNC_PYTHON", 100))
+
+    project_roots = [APP_DIR]
+    if APP_DIR.name.lower() == "release":
+        project_roots.append(APP_DIR.parent)
+    for root in project_roots:
+        if sys.platform == "win32":
+            path = root / ".venv" / "Scripts" / "python.exe"
+        else:
+            path = root / ".venv" / "bin" / "python"
+        candidates.append((str(path), "项目 .venv", 90))
+
+    if not getattr(sys, "frozen", False):
+        candidates.append((sys.executable, "当前 Python", 80))
+
+    for name in ("python", "python3"):
+        found = shutil.which(name)
+        if found:
+            candidates.append((found, f"PATH:{name}", 0))
+
+    launcher = shutil.which("py") if sys.platform == "win32" else None
+    if launcher:
+        try:
+            result = subprocess.run(
+                [launcher, "-0p"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                creationflags=_creation_flags(),
+            )
+            for line in result.stdout.splitlines():
+                match = re.search(r"([A-Za-z]:\\.*python\.exe)\s*$", line, re.IGNORECASE)
+                if match:
+                    candidates.append((match.group(1), "Python Launcher", 10))
+        except Exception:
+            pass
+
+    deduplicated: list[tuple[str, str, int]] = []
+    seen: set[str] = set()
+    for raw_path, source, priority in candidates:
+        path = Path(raw_path).expanduser()
+        if not path.is_file():
+            continue
+        key = str(path.resolve()).casefold()
+        if "windowsapps" in key or key in seen:
+            continue
+        seen.add(key)
+        deduplicated.append((str(path.resolve()), source, priority))
+    return deduplicated
+
+
+def _probe_python(path: str, source: str, priority: int) -> dict:
+    """在独立子进程中检查版本与本工具所需模块。"""
+    code = (
+        "import importlib.util,json,sys;"
+        f"names={list(PYTHON_MODULES)!r};"
+        "print(json.dumps({'version':list(sys.version_info[:3]),"
+        "'modules':{name:bool(importlib.util.find_spec(name)) for name in names}}))"
+    )
+    record = {
+        "path": path,
+        "source": source,
+        "priority": priority,
+        "version": None,
+        "modules": {name: False for name in PYTHON_MODULES},
+        "error": None,
+    }
+    try:
+        result = subprocess.run(
+            [path, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            creationflags=_creation_flags(),
         )
-    else:
-        return sys.executable
+        if result.returncode != 0:
+            record["error"] = (result.stderr or result.stdout).strip()[-500:]
+            return record
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        record["version"] = payload["version"]
+        record["modules"] = payload["modules"]
+    except Exception as error:
+        record["error"] = str(error)
+    return record
+
+
+def _choose_python(probes: list[dict], required_modules: set[str]) -> dict | None:
+    """选择满足必需模块且附加能力最完整的解释器。"""
+    usable = []
+    for probe in probes:
+        version = probe.get("version") or [0, 0, 0]
+        modules = probe.get("modules", {})
+        if tuple(version[:2]) < (3, 10):
+            continue
+        if not all(modules.get(module, False) for module in required_modules):
+            continue
+        optional_score = sum(bool(modules.get(module)) for module in PYTHON_MODULES)
+        usable.append((probe.get("priority", 0), optional_score, tuple(version), probe))
+    return max(usable, default=None, key=lambda item: item[:3])[3] if usable else None
+
+
+def _requirements_path() -> Path:
+    candidates = [APP_DIR / "requirements.txt", EXE_DIR.parent / "requirements.txt"]
+    if hasattr(sys, "_MEIPASS"):
+        candidates.append(Path(sys._MEIPASS) / "requirements.txt")
+    return next((path for path in candidates if path.exists()), candidates[0])
+
+
+def _find_python(required_modules: set[str]) -> tuple[dict, list[dict]]:
+    """探测所有 Python，选择真正具备当前模式依赖的解释器。"""
+    probes = [
+        _probe_python(path, source, priority)
+        for path, source, priority in _candidate_pythons()
+    ]
+    selected = _choose_python(probes, required_modules)
+    if selected:
+        return selected, probes
+
+    checked = []
+    for probe in probes:
+        missing = [
+            module for module in sorted(required_modules)
+            if not probe.get("modules", {}).get(module, False)
+        ]
+        version = ".".join(map(str, probe.get("version") or [])) or "不可用"
+        checked.append(
+            f"- {probe['path']}（Python {version}，缺少: {', '.join(missing) or '无'}）"
+        )
+    requirements = _requirements_path()
+    best_path = probes[0]["path"] if probes else "python"
+    raise RuntimeError(
+        "没有找到满足当前处理模式依赖的 Python。\n\n"
+        + ("已检查：\n" + "\n".join(checked) + "\n\n" if checked else "")
+        + "可在专用环境中安装依赖：\n"
+        + f'"{best_path}" -m pip install -r "{requirements}"'
+    )
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    os.replace(temporary, path)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -534,8 +658,30 @@ class App(tk.Tk):
             return
 
         mode = self.mode_var.get()
+        audio_source = self.audio_source_var.get()
+        required_modules = {"faster_whisper", "rapidfuzz"}
+        if audio_source == "vocals":
+            required_modules.add("demucs")
+        try:
+            selected_python, python_probes = _find_python(required_modules)
+        except RuntimeError as error:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().astimezone().isoformat()
+            LATEST_LOG.write_text(
+                f"[{timestamp}] Python 环境预检失败\n{error}\n",
+                encoding="utf-8",
+            )
+            _write_json(LATEST_DIAGNOSTIC, {
+                "started_at": timestamp,
+                "status": "preflight_failed",
+                "required_modules": sorted(required_modules),
+                "error": str(error),
+                "log_path": str(LATEST_LOG),
+            })
+            messagebox.showerror("Python 环境不完整", str(error))
+            return
 
-        python_exe = _find_python()
+        python_exe = selected_python["path"]
 
         if mode == "single":
             video  = self.video_var.get().strip()
@@ -570,7 +716,7 @@ class App(tk.Tk):
             if odir:
                 cmd += ["--output-dir", odir]
 
-        cmd += ["--audio-source", self.audio_source_var.get()]
+        cmd += ["--audio-source", audio_source]
         if self.no_vad_var.get():
             cmd += ["--no-vad"]
         if self.no_burn_var.get():
@@ -590,35 +736,109 @@ class App(tk.Tk):
         self.start_btn.config(text="⏳  处理中...", state="disabled",
                               bg=C["dim"], activebackground=C["dim"])
         self._set_status("处理中...", C["yellow"])
-        self._log(f"\n{'─'*52}\n▶ 开始处理\n{'─'*52}\n")
+        run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+        run_context = {
+            "run_id": run_id,
+            "started_at": datetime.now().astimezone().isoformat(),
+            "status": "starting",
+            "mode": mode,
+            "audio_source": audio_source,
+            "required_modules": sorted(required_modules),
+            "selected_python": selected_python,
+            "python_candidates": python_probes,
+            "command": cmd,
+            "log_path": str(LATEST_LOG),
+            "run_log_path": str(LOG_DIR / f"run-{run_id}.log"),
+        }
+        self._log(
+            f"\n{'─'*52}\n▶ 开始处理\n{'─'*52}\n"
+            f"Python: {python_exe}\n"
+            f"自动日志: {LATEST_LOG}\n"
+        )
 
-        threading.Thread(target=self._run_cmd, args=(cmd,), daemon=True).start()
+        threading.Thread(
+            target=self._run_cmd,
+            args=(cmd, run_context),
+            daemon=True,
+        ).start()
 
-    def _run_cmd(self, cmd):
+    def _run_cmd(self, cmd, run_context):
         no_burn = "--no-burn" in cmd
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        run_log_path = Path(run_context["run_log_path"])
+        exit_code = None
+        status = "failed"
+
+        def update_diagnostics(**changes):
+            run_context.update(changes)
+            _write_json(LATEST_DIAGNOSTIC, run_context)
+            _write_json(run_log_path.with_suffix(".json"), run_context)
+
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace",
-                bufsize=1,
-            )
-            for line in proc.stdout:
-                self._log(line)
-            proc.wait()
-            if proc.returncode == 0:
-                self._log(f"\n{'─'*52}\n✅ 全部完成！\n{'─'*52}\n")
-                self._set_status("✅ 完成", C["green"])
-                message = "SRT 与对轴报告已生成！" if no_burn else "字幕烧入完成！"
-                self.after(0, lambda: messagebox.showinfo("完成", message))
-            else:
-                self._log(f"\n❌ 脚本退出，返回码: {proc.returncode}\n")
-                self._set_status("❌ 出错", C["red"])
+            with (
+                open(LATEST_LOG, "w", encoding="utf-8") as latest_log,
+                open(run_log_path, "w", encoding="utf-8") as run_log,
+            ):
+                def emit(text):
+                    latest_log.write(text)
+                    latest_log.flush()
+                    run_log.write(text)
+                    run_log.flush()
+                    self._log(text)
+
+                header = (
+                    f"运行时间: {run_context['started_at']}\n"
+                    f"Python: {run_context['selected_python']['path']}\n"
+                    f"Python 来源: {run_context['selected_python']['source']}\n"
+                    f"识别音源: {run_context['audio_source']}\n"
+                    f"命令: {subprocess.list2cmdline(cmd)}\n"
+                    f"{'─'*60}\n"
+                )
+                emit(header)
+                update_diagnostics(status="running")
+
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True, encoding="utf-8", errors="replace",
+                    bufsize=1,
+                )
+                if proc.stdout is not None:
+                    with proc.stdout:
+                        for line in proc.stdout:
+                            emit(line)
+                proc.wait()
+                exit_code = proc.returncode
+                if proc.returncode == 0:
+                    status = "completed"
+                    emit(f"\n{'─'*52}\n✅ 全部完成！\n{'─'*52}\n")
+                    self._set_status("✅ 完成", C["green"])
+                    message = "SRT 与对轴报告已生成！" if no_burn else "字幕烧入完成！"
+                    self.after(0, lambda: messagebox.showinfo("完成", message))
+                else:
+                    status = "failed"
+                    emit(f"\n❌ 脚本退出，返回码: {proc.returncode}\n")
+                    self._set_status("❌ 出错", C["red"])
         except Exception as e:
-            self._log(f"\n❌ 启动失败: {e}\n")
+            status = "launch_failed"
+            error_text = f"\n❌ 启动失败: {e}\n"
+            self._log(error_text)
+            try:
+                with open(LATEST_LOG, "a", encoding="utf-8") as handle:
+                    handle.write(error_text)
+                with open(run_log_path, "a", encoding="utf-8") as handle:
+                    handle.write(error_text)
+            except OSError:
+                pass
+            run_context["error"] = str(e)
             self._set_status("❌ 出错", C["red"])
         finally:
+            update_diagnostics(
+                status=status,
+                exit_code=exit_code,
+                finished_at=datetime.now().astimezone().isoformat(),
+            )
             self.running = False
             self.after(0, lambda: self.start_btn.config(
                 text="▶  开始处理", state="normal",
