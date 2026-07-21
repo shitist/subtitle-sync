@@ -4,6 +4,31 @@
 
 本工具用于把已有中文字幕对到音频时间轴，没有自动翻译功能，亦不是完整的字幕编辑器。
 
+## 下载 Release 直接使用（推荐）
+
+普通使用者无需下载源码或安装 PySide6：
+
+1. 在本仓库的 **Releases** 页面下载最新版本。
+2. 解压完整压缩包，不要只单独复制 `SubtitleSync.exe`。
+3. 双击 `SubtitleSync.exe` 打开界面。
+4. 拖入视频和歌词，选择模型与处理方式后开始。
+
+Release 中的 EXE 已包含图形界面，但不包含 Whisper、Demucs 和语音模型。电脑仍需安装 Python 3.10+ 及 `requirements.txt` 中的识别依赖。第一次使用某个语音模型时会自动联网下载；之后会直接使用本机缓存。
+
+如果运行环境不完整，程序会在处理前列出缺少的组件和安装命令。日常使用不需要通过命令行启动界面。
+
+## 从源码运行
+
+需要修改程序或自行打包时，再使用源码方式：
+
+```powershell
+pip install -r requirements.txt
+pip install -r requirements-gui.txt
+python subtitle_sync_gui.py
+```
+
+`requirements.txt` 是识别和视频处理依赖；`requirements-gui.txt` 只用于从源码运行或打包图形界面。
+
 ## 适合场景与局限
 
 适合：
@@ -15,7 +40,7 @@
 
 目前的局限：
 
-- 当前版本相比原始方案已有明显改善，但自动对轴精度仍未达到可直接交付的水平。即使使用 `Large v3`，个别字幕仍可能出现数秒误差，生成结果应视为需要人工复核的初稿。
+- 自动对轴结果仅供人工复核，不能直接交付；即使使用 `Large v3`，目前算法下个别字幕仍可能有 0–5 秒误差。
 - 不会把日语自动翻译成中文，必须提供准备好的中文字幕或歌词。
 - 识别语言固定为日语。Whisper 本身支持其他语言，但其他语言的歌词解析与匹配效果尚未经过实测。
 - 歌唱、和声、多人重叠、现场噪声、混响和重伴奏都会降低识别与文本锚点覆盖率。
@@ -61,23 +86,17 @@
 
 有日文原文时，程序会在 Whisper 独立识别完成后比较日文歌词与识别文字，不会把整段歌词作为识别提示。没有日文原文时，程序优先使用中文字幕中的英文/数字短语建立局部锚点；可用锚点不足时才使用低置信度时间比例回退。
 
-## 环境要求
+## 运行环境
 
 - Python 3.10+
 - FFmpeg（推荐加入系统 `PATH`）
 - 首次使用所选模型时需要联网自动下载
 - 模型越大，对内存或显存的要求越高
 
-安装 Python 依赖：
+Release 用户和源码用户都需要安装识别依赖：
 
 ```powershell
 pip install -r requirements.txt
-```
-
-从源码运行或打包图形界面时，再安装：
-
-```powershell
-pip install -r requirements-gui.txt
 ```
 
 有 NVIDIA 显卡时需要安装与本机 CUDA 环境匹配的 PyTorch/CTranslate2 运行库。没有可用 GPU 时会使用 CPU `int8`。
@@ -95,7 +114,7 @@ pip install -r requirements-gui.txt
 
 ### 中文段＋日文段
 
-中文整块与日文整块之间保留至少两个完整空行：
+中文整块与日文整块之间保留至少**两个完整空行**：
 
 ```text
 在世界终结之处
@@ -106,7 +125,7 @@ pip install -r requirements-gui.txt
 生まれた光
 ```
 
-连续两个及以上空行会被当作明确的块分隔符；单个空行只用于歌词段落排版并会被忽略。没有双空行时，程序继续通过日文假名位置兼容旧歌词文件。两段行数相同时会按行配对。行数不一致时，程序会给出警告，缺少日文原文的行将通过相邻文本锚点补齐并列入待检查项。
+**连续两个及以上空行会被当作明确的块分隔符**；单个空行只用于歌词段落排版并会被忽略。没有双空行时，程序继续通过日文假名位置兼容旧歌词文件。两段行数相同时会按行配对。行数不一致时，程序会给出警告，缺少日文原文的行将通过相邻文本锚点补齐并列入待检查项。
 
 ### 纯中文（低置信度回退）
 
@@ -117,22 +136,17 @@ pip install -r requirements-gui.txt
 
 纯中文无法与日语识别文本直接比较。歌词中存在足够英文/数字短语时会使用这些内容作为低置信度顺序锚点，其余行仅在相邻锚点间补齐；否则只能利用声音片段边界估算时间。
 
-## 使用方法
+## 界面与命令行
 
-### 图形界面
-
-```powershell
-python subtitle_sync_gui.py
-```
+### 界面功能
 
 界面支持：
 
 - 单文件和批量处理
-- 跟随系统、浅色和深色三种外观
-- 将视频和歌词直接拖入窗口
+- 视频和歌词拖拽功能
 - 四档语音模型预设及适用场景说明
 - Demucs 人声或原始混合音频
-- 仅生成 SRT，不烧录视频
+- 仅生成 SRT
 - 强制重新运行 Whisper
 - 启用或禁用 VAD
 - 固定显示当前阶段、进度条和已运行时间
@@ -228,6 +242,26 @@ python subtitle_sync.py --batch --video-dir ./videos --lyrics-dir ./lyrics
 
 修改歌词、对轴算法或相似度阈值时可以直接复用 `.whisper.json`，无需重新运行 Demucs 和 Whisper。输入视频、模型、VAD、音源或识别配置变化时缓存会自动失效。
 
+## 项目结构
+
+```text
+Subtitle-tool/
+├─ subtitle_sync.py          核心处理与命令行入口
+├─ subtitle_sync_gui.py      PySide6 图形界面
+├─ requirements.txt          识别和视频处理依赖
+├─ requirements-gui.txt      源码运行与打包 GUI 的依赖
+├─ build.spec                PyInstaller 打包配置
+├─ tests/                    对轴、缓存和 GUI 测试
+├─ release/                  Release 发布包内容
+│  ├─ SubtitleSync.exe       Windows 图形界面程序
+│  ├─ subtitle_sync.py       EXE 优先调用的外置核心脚本
+│  └─ requirements.txt       Release 运行依赖
+├─ LICENSE                   MIT License
+└─ README.md                 使用说明
+```
+
+`build/`、`dist/`、日志、模型缓存和生成的媒体文件属于本地构建或运行产物，不纳入源码仓库。`release/SubtitleSync.exe` 作为 GitHub Release 附件发布。
+
 ## 打包说明
 
 ```powershell
@@ -235,7 +269,7 @@ pip install -r requirements-gui.txt
 pyinstaller build.spec
 ```
 
-打包后的 `SubtitleSync.exe` 内置 PySide6 界面，但不内置 Whisper、Demucs 和模型。目标机器仍需安装可用的 Python 3.10+ 及 `requirements.txt` 中的依赖。EXE 会优先使用同目录的 `subtitle_sync.py`，方便更新核心算法。由于包含 Qt 运行库，新版 EXE 会比原来的 Tkinter 版本大。
+打包后的 `SubtitleSync.exe` 内置 PySide6 界面，但不内置 Whisper、Demucs 和模型。目标机器仍需安装可用的 Python 3.10+ 及 `requirements.txt` 中的依赖。EXE 会优先使用同目录的 `subtitle_sync.py`，方便更新核心算法。
 
 ## 测试
 
@@ -244,3 +278,7 @@ python -m unittest discover -s tests -v
 ```
 
 测试覆盖文本匹配、漏识别局部补齐、重复副歌顺序、纯中文回退、缓存校验、对轴报告、Python 环境选择和 GUI 日志精简规则。
+
+## 许可证
+
+本项目采用 [MIT License](LICENSE)。发布源码、Release 和派生版本时应保留许可证与版权声明。
