@@ -114,6 +114,8 @@ python subtitle_sync.py --video song.mp4 --lyrics song.txt
 python subtitle_sync.py --video song.mp4 --lyrics song.txt --no-burn
 ```
 
+`--no-burn` 只跳过最后的 FFmpeg 视频重编码；首次运行仍需进行音频提取、可选的 Demucs 人声分离和 Whisper 识别，因此不会立刻完成。识别结果写入 `.whisper.json` 后，只要视频、歌词、VAD 和音源设置不变，后续调整对轴会直接复用缓存。GUI 在长步骤中每 30 秒写入一次运行心跳，并实时刷新已经产生的 Whisper 片段。
+
 使用原始混合音频识别，跳过 Demucs：
 
 ```powershell

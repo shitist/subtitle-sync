@@ -232,13 +232,18 @@ def transcribe_audio(
         transcribe_kwargs.pop("hotwords")
         segments_gen, info = model.transcribe(str(audio_path), **transcribe_kwargs)
 
-    segments = list(segments_gen)
-    print(f"    Whisper 识别完成，共 {len(segments)} 个片段")
-    for i, seg in enumerate(segments):
+    segments = []
+    for i, seg in enumerate(segments_gen, 1):
+        segments.append(seg)
         word_info = ""
         if hasattr(seg, "words") and seg.words:
             word_info = f"  [words: {len(seg.words)}]"
-        print(f"      [{i+1:03d}] {seg.start:.2f}s → {seg.end:.2f}s{word_info}  {seg.text.strip()}")
+        print(
+            f"      [{i:03d}] {seg.start:.2f}s → {seg.end:.2f}s"
+            f"{word_info}  {seg.text.strip()}",
+            flush=True,
+        )
+    print(f"    Whisper 识别完成，共 {len(segments)} 个片段", flush=True)
 
     return segments
 

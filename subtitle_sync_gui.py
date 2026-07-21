@@ -13,6 +13,7 @@ import re
 import shutil
 import threading
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
@@ -695,7 +696,7 @@ class App(tk.Tk):
                 messagebox.showwarning("缺少文件", "请选择歌词文件")
                 return
 
-            cmd = [python_exe, str(SYNC_SCRIPT),
+            cmd = [python_exe, "-u", str(SYNC_SCRIPT),
                    "--video", video, "--lyrics", lyrics]
             if output:
                 cmd += ["--output", output]
@@ -711,7 +712,7 @@ class App(tk.Tk):
                 messagebox.showwarning("缺少目录", "请选择歌词目录")
                 return
 
-            cmd = [python_exe, str(SYNC_SCRIPT),
+            cmd = [python_exe, "-u", str(SYNC_SCRIPT),
                    "--batch", "--video-dir", vdir, "--lyrics-dir", ldir]
             if odir:
                 cmd += ["--output-dir", odir]
@@ -779,12 +780,15 @@ class App(tk.Tk):
                 open(LATEST_LOG, "w", encoding="utf-8") as latest_log,
                 open(run_log_path, "w", encoding="utf-8") as run_log,
             ):
+                emit_lock = threading.Lock()
+
                 def emit(text):
-                    latest_log.write(text)
-                    latest_log.flush()
-                    run_log.write(text)
-                    run_log.flush()
-                    self._log(text)
+                    with emit_lock:
+                        latest_log.write(text)
+                        latest_log.flush()
+                        run_log.write(text)
+                        run_log.flush()
+                        self._log(text)
 
                 header = (
                     f"运行时间: {run_context['started_at']}\n"
@@ -804,10 +808,23 @@ class App(tk.Tk):
                     text=True, encoding="utf-8", errors="replace",
                     bufsize=1,
                 )
-                if proc.stdout is not None:
-                    with proc.stdout:
-                        for line in proc.stdout:
-                            emit(line)
+                def pump_output():
+                    if proc.stdout is not None:
+                        with proc.stdout:
+                            for line in proc.stdout:
+                                emit(line)
+
+                reader = threading.Thread(target=pump_output, daemon=True)
+                reader.start()
+                started_waiting = time.monotonic()
+                next_heartbeat = 30
+                while proc.poll() is None:
+                    reader.join(timeout=1)
+                    elapsed = int(time.monotonic() - started_waiting)
+                    if elapsed >= next_heartbeat:
+                        emit(f"\n⏳ 仍在处理，已运行 {elapsed} 秒...\n")
+                        next_heartbeat += 30
+                reader.join(timeout=5)
                 proc.wait()
                 exit_code = proc.returncode
                 if proc.returncode == 0:
