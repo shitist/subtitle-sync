@@ -63,6 +63,25 @@ a = Analysis(
     noarchive=False,
 )
 
+# Qt 6 on Windows uses the operating system ICU. A build shell may also expose
+# an unrelated Poppler/Conda ICU through PATH; PyInstaller can otherwise bundle
+# that DLL next to Qt6Core and cause "procedure not found" at startup.
+foreign_icu_names = {"icuuc.dll", "icuin.dll"}
+a.binaries = [
+    entry
+    for entry in a.binaries
+    if not (
+        (
+            Path(entry[0]).name.casefold() in foreign_icu_names
+            or (
+                Path(entry[0]).name.casefold().startswith("icudt")
+                and Path(entry[0]).name.casefold().endswith(".dll")
+            )
+        )
+        and "pyside6" not in str(entry[1]).replace("\\", "/").casefold()
+    )
+]
+
 pyz = PYZ(a.pure, a.zipped_data, cipher=None)
 
 exe = EXE(

@@ -1401,6 +1401,9 @@ def main() -> int:
         application.setStyle(fusion)
     application.setFont(QFont("Microsoft YaHei UI", 9))
     window = App()
+    if "--smoke-test" in sys.argv:
+        application.processEvents()
+        return 0
     window.show()
     return application.exec()
 
