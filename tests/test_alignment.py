@@ -6,15 +6,22 @@ from pathlib import Path
 from subtitle_sync import (
     AlignmentItem,
     LyricLine,
+    OcrFrame,
+    OcrLineAnchor,
     SimpleSegment,
     WordTiming,
+    _ocr_metadata,
     _normalize_japanese,
     _transcript_metadata,
+    apply_ocr_timing_assist,
     align_lyrics_to_segments,
+    build_ocr_line_anchors,
     load_lyrics,
+    load_ocr_cache,
     load_transcript_cache,
     process_single,
     save_alignment_report,
+    save_ocr_cache,
     save_transcript_cache,
 )
 
@@ -182,6 +189,45 @@ class TextAlignmentTests(unittest.TestCase):
         self.assertEqual(aligned[0].word_probability, 0.2)
 
 
+class OcrAssistanceTests(unittest.TestCase):
+    def test_vertical_ocr_characters_form_a_lyric_anchor(self):
+        frames = [OcrFrame(11.0, ("待", "っ", "た"), (0.99, 0.98, 0.99))]
+        lyrics = [LyricLine("待った！ナシだ", "等等！这可不算")]
+        baseline = [AlignmentItem(10.0, 12.0, lyrics[0].zh, lyrics[0].ja)]
+
+        anchors = build_ocr_line_anchors(frames, lyrics, baseline)
+
+        self.assertEqual(len(anchors), 1)
+        self.assertEqual(anchors[0].recognized_text, "待った")
+        self.assertGreaterEqual(anchors[0].score, 82.0)
+
+    def test_ocr_correction_preserves_gaps_and_minimum_duration(self):
+        baseline = [
+            AlignmentItem(0.0, 2.0, "第一行"),
+            AlignmentItem(2.2, 2.7, "短句"),
+            AlignmentItem(2.9, 5.0, "第三行"),
+        ]
+        anchors = [
+            OcrLineAnchor(i, item.start + 1.0, 1.0, item.text, item.text, 99.0, 0.5)
+            for i, item in enumerate(baseline)
+        ]
+
+        corrected = apply_ocr_timing_assist(baseline, anchors)
+
+        self.assertAlmostEqual(corrected[0].start, 1.0)
+        self.assertAlmostEqual(corrected[-1].end, 6.0)
+        self.assertGreaterEqual(corrected[1].end - corrected[1].start, 0.5)
+        self.assertLessEqual(corrected[0].end, corrected[1].start)
+        self.assertLessEqual(corrected[1].end, corrected[2].start)
+        self.assertEqual(corrected[1].ocr_score, 99.0)
+
+    def test_too_few_ocr_anchors_leave_baseline_unchanged(self):
+        baseline = [AlignmentItem(i, i + 0.8, str(i)) for i in range(10)]
+        anchors = [OcrLineAnchor(0, 0.5, 0.5, "一", "一", 99.0, 0.5)]
+
+        self.assertIs(apply_ocr_timing_assist(baseline, anchors), baseline)
+
+
 class ArtifactTests(unittest.TestCase):
     def test_transcript_metadata_does_not_depend_on_lyrics_content(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -232,6 +278,21 @@ class ArtifactTests(unittest.TestCase):
             self.assertIsNotNone(loaded)
             self.assertEqual(loaded[0].words[0].text, "歌詞")
             self.assertIsNone(load_transcript_cache(cache, {"key": "other"}))
+
+    def test_ocr_cache_round_trip_and_metadata_guard(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            video = root / "sample.mp4"
+            cache = root / "sample.ocr.json"
+            video.write_bytes(b"same-video")
+            metadata = _ocr_metadata(video, 0.5)
+            frames = [OcrFrame(1.5, ("日本語",), (0.95,))]
+            save_ocr_cache(cache, frames, metadata)
+
+            loaded = load_ocr_cache(cache, metadata)
+
+            self.assertEqual(loaded, frames)
+            self.assertIsNone(load_ocr_cache(cache, _ocr_metadata(video, 1.0)))
 
     def test_alignment_report_marks_review_lines(self):
         aligned = [

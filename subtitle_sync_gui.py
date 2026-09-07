@@ -72,13 +72,18 @@ PYTHON_MODULES = (
     "faster_whisper",
     "demucs",
     "rapidfuzz",
+    "rapidocr",
+    "onnxruntime",
     "imageio_ffmpeg",
     "torch",
 )
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".m4v"}
 LYRIC_EXTENSIONS = {".txt", ".lrc"}
-STAGE_PROGRESS = {1: 5, 2: 14, 3: 24, 4: 38, 5: 78, 6: 88, 7: 95}
+STAGE_PROGRESS = {
+    7: {1: 5, 2: 14, 3: 24, 4: 38, 5: 78, 6: 88, 7: 95},
+    8: {1: 5, 2: 14, 3: 24, 4: 38, 5: 48, 6: 55, 7: 88, 8: 95},
+}
 MODEL_OPTIONS = (
     {
         "id": "large-v3",
@@ -332,14 +337,29 @@ def parse_runtime_line(raw_line: str) -> dict | None:
     if not line or not line.strip("─═-"):
         return None
 
-    stage_match = re.match(r"^\[(\d+)/7\]\s*(.+?)(?:\.\.\.)?$", line)
+    stage_match = re.match(r"^\[(\d+)/(\d+)\]\s*(.+?)(?:\.\.\.)?$", line)
     if stage_match:
         stage = int(stage_match.group(1))
+        total = int(stage_match.group(2))
         return {
             "kind": "stage",
             "stage": stage,
-            "progress": STAGE_PROGRESS.get(stage, 0),
-            "message": stage_match.group(2).strip(),
+            "progress": STAGE_PROGRESS.get(total, {}).get(
+                stage,
+                round(stage / max(total, 1) * 95),
+            ),
+            "message": stage_match.group(3).strip(),
+        }
+
+    ocr_progress = re.match(r"^OCR 扫描进度:\s*(\d+)/(\d+)$", line)
+    if ocr_progress:
+        current = int(ocr_progress.group(1))
+        total = max(1, int(ocr_progress.group(2)))
+        return {
+            "kind": "ocr_progress",
+            "count": current,
+            "total": total,
+            "progress": 55 + round(current / total * 30),
         }
 
     segment_match = re.match(r"^\[(\d{3})\]\s+\d+(?:\.\d+)?s\s*[→-]", line)
@@ -376,6 +396,7 @@ def parse_runtime_line(raw_line: str) -> dict | None:
     useful_prefixes = (
         "检测到",
         "复用 Whisper",
+        "复用 OCR",
         "已有 Whisper",
         "Whisper 识别完成",
         "Whisper 转录缓存",
@@ -383,6 +404,11 @@ def parse_runtime_line(raw_line: str) -> dict | None:
         "使用设备:",
         "文本锚点:",
         "英文锚点",
+        "OCR 画面锚点:",
+        "OCR 修正明显错位边界:",
+        "OCR 可靠锚点不足",
+        "OCR 扫描缓存",
+        "OCR 辅助覆盖率:",
         "对轴模式:",
         "SRT 文件",
         "对轴报告",
@@ -437,6 +463,10 @@ def _build_processing_command(python_exe: str, config: dict) -> list[str]:
         command.append("--no-burn")
     if config.get("refresh"):
         command.append("--refresh-transcript")
+    if config.get("ocr_assist"):
+        command.append("--ocr-assist")
+        if config.get("refresh"):
+            command.append("--refresh-ocr")
     return command
 
 
@@ -796,10 +826,16 @@ class App(QMainWindow):
         self.no_burn_cb.setToolTip("生成 SRT 和对轴报告，不重新编码视频。识别步骤仍会运行。")
         self.refresh_cb = QCheckBox("重新识别")
         self.refresh_cb.setToolTip("忽略已有 Whisper 缓存，重新提取音频并识别。")
+        self.ocr_assist_cb = QCheckBox("画面歌词辅助")
+        self.ocr_assist_cb.setToolTip(
+            "视频画面本身带有歌词或硬字幕时，可用 OCR 校正局部漂移。\n"
+            "会增加数分钟处理时间；没有画面文字时请勿开启。"
+        )
         self.no_vad_cb = QCheckBox("禁用 VAD")
         self.no_vad_cb.setToolTip("保留所有音频区间。通常无需开启。")
         grid.addWidget(self.no_burn_cb, 3, 2)
         grid.addWidget(self.refresh_cb, 3, 3)
+        grid.addWidget(self.ocr_assist_cb, 4, 1)
         grid.addWidget(self.no_vad_cb, 4, 2)
         grid.setColumnStretch(1, 1)
         return card
@@ -1066,6 +1102,7 @@ class App(QMainWindow):
             "no_vad": self.no_vad_cb.isChecked(),
             "no_burn": self.no_burn_cb.isChecked(),
             "refresh": self.refresh_cb.isChecked(),
+            "ocr_assist": self.ocr_assist_cb.isChecked(),
         }
 
         if mode == "single":
@@ -1122,6 +1159,8 @@ class App(QMainWindow):
         required_modules = {"faster_whisper", "rapidfuzz"}
         if config["audio_source"] == "vocals":
             required_modules.add("demucs")
+        if config.get("ocr_assist"):
+            required_modules.update({"rapidocr", "onnxruntime"})
 
         try:
             selected_python, python_probes = _find_python(required_modules)
@@ -1160,6 +1199,7 @@ class App(QMainWindow):
             "mode": config["mode"],
             "audio_source": config["audio_source"],
             "model": config["model"],
+            "ocr_assist": config.get("ocr_assist", False),
             "required_modules": sorted(required_modules),
             "selected_python": selected_python,
             "python_candidates": python_probes,
@@ -1202,6 +1242,7 @@ class App(QMainWindow):
                     f"Python 来源: {run_context['selected_python']['source']}\n"
                     f"识别模型: {run_context['model']}\n"
                     f"识别音源: {run_context['audio_source']}\n"
+                    f"画面歌词辅助: {'是' if run_context.get('ocr_assist') else '否'}\n"
                     f"命令: {subprocess.list2cmdline(cmd)}\n"
                     f"{'─' * 60}\n"
                 )
@@ -1287,6 +1328,12 @@ class App(QMainWindow):
                 self._append_log(event["message"])
             elif event["kind"] == "recognition":
                 self._apply_status(f"语音识别 · {event['count']} 个片段", "working")
+            elif event["kind"] == "ocr_progress":
+                self.progress_bar.setValue(event["progress"])
+                self._apply_status(
+                    f"扫描画面歌词 · {event['count']}/{event['total']}",
+                    "working",
+                )
             elif event["kind"] == "log":
                 self._append_log(event["message"])
 
@@ -1315,6 +1362,7 @@ class App(QMainWindow):
         self.model_combo.setEnabled(not running)
         self.no_burn_cb.setEnabled(not running)
         self.refresh_cb.setEnabled(not running)
+        self.ocr_assist_cb.setEnabled(not running)
         self.no_vad_cb.setEnabled(not running)
         if not running:
             self._elapsed_timer.stop()

@@ -41,7 +41,7 @@ import subprocess
 import shutil
 import tempfile
 import unicodedata
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Optional
@@ -56,7 +56,10 @@ if sys.platform == "win32":
 
 
 TRANSCRIPT_CACHE_SCHEMA = 2
+OCR_CACHE_SCHEMA = 1
 DEFAULT_MIN_MATCH_SCORE = 55.0
+DEFAULT_OCR_MATCH_SCORE = 82.0
+DEFAULT_OCR_SAMPLE_INTERVAL = 0.5
 DEFAULT_WHISPER_MODEL = "large-v3"
 SUPPORTED_WHISPER_MODELS = (
     "large-v3",
@@ -106,6 +109,34 @@ class AlignmentItem:
     score: Optional[float] = None
     status: str = "timing_fallback"
     word_probability: Optional[float] = None
+    ocr_text: str = ""
+    ocr_score: Optional[float] = None
+    ocr_shift: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class OcrFrame:
+    """一次画面采样中识别到的文字。"""
+
+    time: float
+    texts: tuple[str, ...]
+    confidences: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class OcrLineAnchor:
+    """OCR 文字与一行歌词之间的候选时间锚点。"""
+
+    line_index: int
+    time: float
+    delta: float
+    source_text: str
+    recognized_text: str
+    score: float
+    target_fraction: float
+    visual_start: Optional[float] = None
+    visual_end: Optional[float] = None
+    sample_count: int = 1
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -496,6 +527,406 @@ def _similarity(left: str, right: str) -> float:
         return float(ratio(left, right))
     except ImportError:
         return SequenceMatcher(None, left, right).ratio() * 100.0
+
+
+def _ocr_text_candidates(frame: OcrFrame) -> list[tuple[str, float]]:
+    """组合同一画面中相邻 OCR 文本，兼容被拆成单字的竖排歌词。"""
+    items = [
+        (text.strip(), float(confidence))
+        for text, confidence in zip(frame.texts, frame.confidences)
+        if _normalize_japanese(text)
+    ]
+    candidates: dict[str, tuple[str, float]] = {}
+    for start in range(len(items)):
+        parts: list[str] = []
+        confidences: list[float] = []
+        for end in range(start, min(len(items), start + 5)):
+            text, confidence = items[end]
+            parts.append(text)
+            confidences.append(confidence)
+            combined = "".join(parts)
+            normalized = _normalize_japanese(combined)
+            if len(normalized) < 3:
+                continue
+            average_confidence = sum(confidences) / len(confidences)
+            existing = candidates.get(normalized)
+            if existing is None or average_confidence > existing[1]:
+                candidates[normalized] = (combined, average_confidence)
+    return list(candidates.values())
+
+
+def _score_ocr_candidate(
+    target: str,
+    observed: str,
+    confidence: float,
+) -> tuple[float, float]:
+    """返回 OCR 片段匹配分和该片段在歌词中的相对位置。"""
+    normalized_target = _normalize_japanese(target)
+    normalized_observed = _normalize_japanese(observed)
+    if len(normalized_target) < 3 or len(normalized_observed) < 3:
+        return 0.0, 0.5
+
+    matcher = SequenceMatcher(None, normalized_target, normalized_observed)
+    block = max(matcher.get_matching_blocks(), key=lambda item: item.size)
+    if block.size < 3:
+        return 0.0, 0.5
+
+    try:
+        from rapidfuzz.fuzz import partial_ratio
+        partial_score = float(partial_ratio(normalized_target, normalized_observed))
+    except ImportError:
+        partial_score = matcher.ratio() * 100.0
+
+    overlap_score = block.size / min(
+        len(normalized_target),
+        len(normalized_observed),
+    ) * 100.0
+    length_factor = 0.75 + 0.25 * min(1.0, block.size / 8.0)
+    confidence_factor = 0.90 + 0.10 * max(0.0, min(1.0, confidence))
+    score = (
+        partial_score * 0.72 + overlap_score * 0.28
+    ) * length_factor * confidence_factor
+    target_fraction = (
+        block.a + block.size / 2.0
+    ) / len(normalized_target)
+    return round(score, 2), max(0.0, min(1.0, target_fraction))
+
+
+def _match_ocr_frame(
+    target: str,
+    frame: OcrFrame,
+) -> tuple[float, str, float]:
+    """找出一帧 OCR 结果中与目标歌词最接近的连续文本。"""
+    best = (0.0, "", 0.5)
+    for candidate, confidence in _ocr_text_candidates(frame):
+        score, target_fraction = _score_ocr_candidate(
+            target,
+            candidate,
+            confidence,
+        )
+        if score > best[0]:
+            best = (score, candidate, target_fraction)
+    return best
+
+
+def build_ocr_line_anchors(
+    frames: list[OcrFrame],
+    lyric_lines: list[LyricLine],
+    baseline: list[AlignmentItem],
+    min_match_score: float = DEFAULT_OCR_MATCH_SCORE,
+    max_shift_seconds: float = 6.0,
+) -> list[OcrLineAnchor]:
+    """在 Whisper 粗轴附近寻找顺序明确的画面歌词锚点。"""
+    if len(lyric_lines) != len(baseline):
+        raise ValueError("OCR 辅助要求歌词行数与基础时间轴一致")
+
+    anchors: list[OcrLineAnchor] = []
+    for line_index, (line, item) in enumerate(zip(lyric_lines, baseline)):
+        # 尖括号通常是和声或画面附注，不把它抢到的高分当成主句锚点。
+        target = re.sub(r"<[^>]*>", "", line.ja or line.zh).strip()
+        if len(_normalize_japanese(target)) < 3:
+            continue
+
+        duration = max(0.2, item.end - item.start)
+        candidates = []
+        for frame in frames:
+            if frame.time < item.start - max_shift_seconds:
+                continue
+            if frame.time > item.end + max_shift_seconds:
+                break
+            score, recognized, target_fraction = _match_ocr_frame(target, frame)
+            if score < min_match_score:
+                continue
+            expected_time = item.start + duration * target_fraction
+            delta = frame.time - expected_time
+            if abs(delta) > max_shift_seconds:
+                continue
+            rank = score - abs(delta) * 1.5
+            candidates.append({
+                "frame": frame,
+                "score": score,
+                "recognized": recognized,
+                "target_fraction": target_fraction,
+                "delta": delta,
+                "rank": rank,
+            })
+
+        if not candidates:
+            continue
+
+        frame_intervals = [
+            frames[index].time - frames[index - 1].time
+            for index in range(1, len(frames))
+            if frames[index].time > frames[index - 1].time
+        ]
+        sample_interval = (
+            sorted(frame_intervals)[len(frame_intervals) // 2]
+            if frame_intervals
+            else DEFAULT_OCR_SAMPLE_INTERVAL
+        )
+        groups: list[list[dict]] = []
+        for candidate in candidates:
+            if (
+                not groups
+                or candidate["frame"].time - groups[-1][-1]["frame"].time
+                > sample_interval * 1.55
+            ):
+                groups.append([candidate])
+            else:
+                groups[-1].append(candidate)
+        best_group = max(
+            groups,
+            key=lambda group: (
+                max(candidate["score"] for candidate in group)
+                + min(len(group), 10) * 4.0
+                - min(abs(candidate["delta"]) for candidate in group)
+            ),
+        )
+        best = max(best_group, key=lambda candidate: candidate["rank"])
+        nearby = [
+            candidate
+            for candidate in best_group
+            if abs(candidate["frame"].time - best["frame"].time) <= 1.25
+            and abs(candidate["delta"] - best["delta"]) <= 1.5
+            and candidate["score"] >= best["score"] - 8.0
+        ]
+        weights = [
+            max(1.0, candidate["score"] - min_match_score + 1.0) ** 2
+            for candidate in nearby
+        ]
+        weight_sum = sum(weights)
+        weighted_time = sum(
+            candidate["frame"].time * weight
+            for candidate, weight in zip(nearby, weights)
+        ) / weight_sum
+        weighted_delta = sum(
+            candidate["delta"] * weight
+            for candidate, weight in zip(nearby, weights)
+        ) / weight_sum
+        anchors.append(OcrLineAnchor(
+            line_index=line_index,
+            time=round(weighted_time, 3),
+            delta=round(weighted_delta, 3),
+            source_text=target,
+            recognized_text=best["recognized"],
+            score=round(best["score"], 2),
+            target_fraction=round(best["target_fraction"], 4),
+            visual_start=(
+                round(best_group[0]["frame"].time - sample_interval / 2.0, 3)
+                if len(best_group) >= 2
+                else None
+            ),
+            visual_end=(
+                round(best_group[-1]["frame"].time + sample_interval / 2.0, 3)
+                if len(best_group) >= 2
+                else None
+            ),
+            sample_count=len(best_group),
+        ))
+    return anchors
+
+
+def apply_ocr_timing_assist(
+    baseline: list[AlignmentItem],
+    anchors: list[OcrLineAnchor],
+) -> list[AlignmentItem]:
+    """用 OCR 估计的局部漂移移动边界，同时保留原字幕间隔。"""
+    line_count = len(baseline)
+    minimum_anchors = min(line_count, max(3, (line_count + 9) // 10))
+    if line_count == 0 or len(anchors) < minimum_anchors:
+        print(
+            f"    OCR 可靠锚点不足（{len(anchors)}/{line_count}），"
+            "保留原有 Whisper 时间轴。"
+        )
+        return baseline
+
+    anchor_map = {anchor.line_index: anchor for anchor in anchors}
+    anchor_indices = sorted(anchor_map)
+    shifts: list[float] = []
+    for index in range(line_count):
+        if index in anchor_map:
+            shifts.append(anchor_map[index].delta)
+            continue
+        left = next((value for value in reversed(anchor_indices) if value < index), None)
+        right = next((value for value in anchor_indices if value > index), None)
+        if left is not None and right is not None:
+            left_time = (baseline[left].start + baseline[left].end) / 2.0
+            right_time = (baseline[right].start + baseline[right].end) / 2.0
+            current_time = (baseline[index].start + baseline[index].end) / 2.0
+            span = max(0.001, right_time - left_time)
+            ratio = max(0.0, min(1.0, (current_time - left_time) / span))
+            shifts.append(
+                anchor_map[left].delta * (1.0 - ratio)
+                + anchor_map[right].delta * ratio
+            )
+        elif left is not None and index - left <= 2:
+            shifts.append(anchor_map[left].delta)
+        elif right is not None and right - index <= 2:
+            shifts.append(anchor_map[right].delta)
+        else:
+            shifts.append(0.0)
+
+    # 相邻歌词不允许出现突兀的大幅反向跳动；这类情况通常是重复副歌误匹配。
+    for index in range(1, line_count):
+        shifts[index] = max(
+            shifts[index - 1] - 2.0,
+            min(shifts[index - 1] + 2.0, shifts[index]),
+        )
+    for index in range(line_count - 2, -1, -1):
+        shifts[index] = max(
+            shifts[index + 1] - 2.0,
+            min(shifts[index + 1] + 2.0, shifts[index]),
+        )
+
+    starts: list[float] = [0.0] * line_count
+    ends: list[float] = [0.0] * line_count
+    starts[0] = max(0.0, baseline[0].start + shifts[0])
+    ends[-1] = baseline[-1].end + shifts[-1]
+
+    for index in range(line_count - 1):
+        original_gap = max(
+            0.0,
+            baseline[index + 1].start - baseline[index].end,
+        )
+        original_center = (
+            baseline[index].end + baseline[index + 1].start
+        ) / 2.0
+        boundary_shift = (shifts[index] + shifts[index + 1]) / 2.0
+        corrected_center = original_center + boundary_shift
+        ends[index] = corrected_center - original_gap / 2.0
+        starts[index + 1] = corrected_center + original_gap / 2.0
+
+    visual_boundary_corrections = 0
+    for index in range(line_count - 1):
+        left_anchor = anchor_map.get(index)
+        right_anchor = anchor_map.get(index + 1)
+        if not left_anchor or not right_anchor:
+            continue
+        if (
+            left_anchor.visual_end is None
+            or right_anchor.visual_start is None
+            or right_anchor.visual_start < left_anchor.visual_end
+            or right_anchor.visual_start - left_anchor.visual_end > 1.5
+        ):
+            continue
+        current_center = (ends[index] + starts[index + 1]) / 2.0
+        visual_center = (
+            left_anchor.visual_end + right_anchor.visual_start
+        ) / 2.0
+        if abs(current_center - visual_center) <= 1.5:
+            continue
+        ends[index] = left_anchor.visual_end
+        starts[index + 1] = right_anchor.visual_start
+        visual_boundary_corrections += 1
+
+    # 极短的 Okay / C'mon 等行容易被两侧不同的修正量挤扁。
+    # 局部移动两侧边界，至少保留原长度或 0.5 秒中的较小值。
+    for _ in range(line_count * 2):
+        changed = False
+        for index in range(line_count):
+            minimum_duration = min(
+                0.5,
+                max(0.08, baseline[index].end - baseline[index].start),
+            )
+            deficit = minimum_duration - (ends[index] - starts[index])
+            if deficit <= 1e-6:
+                continue
+            changed = True
+            left_adjustment = deficit / 2.0 if index > 0 else 0.0
+            right_adjustment = deficit - left_adjustment if index < line_count - 1 else 0.0
+            if index > 0:
+                starts[index] -= left_adjustment
+                ends[index - 1] -= left_adjustment
+            if index < line_count - 1:
+                ends[index] += right_adjustment
+                starts[index + 1] += right_adjustment
+        if not changed:
+            break
+
+    if any(end - start < 0.079 for start, end in zip(starts, ends)):
+        print("    OCR 修正会产生无效字幕区间，已保留原有 Whisper 时间轴。")
+        return baseline
+
+    corrected = []
+    for index, item in enumerate(baseline):
+        anchor = anchor_map.get(index)
+        corrected.append(replace(
+            item,
+            start=round(starts[index], 3),
+            end=round(ends[index], 3),
+            ocr_text=anchor.recognized_text if anchor else "",
+            ocr_score=anchor.score if anchor else None,
+            ocr_shift=round(shifts[index], 3),
+        ))
+    print(
+        f"    OCR 画面锚点: {len(anchors)}/{line_count} 行，"
+        "已校正局部漂移。"
+    )
+    if visual_boundary_corrections:
+        print(f"    OCR 修正明显错位边界: {visual_boundary_corrections} 处。")
+    return corrected
+
+
+def scan_video_ocr(
+    video_path: Path,
+    work_dir: Path,
+    sample_interval: float = DEFAULT_OCR_SAMPLE_INTERVAL,
+) -> list[OcrFrame]:
+    """按固定间隔扫描全画面文字，返回可缓存的 OCR 帧。"""
+    if sample_interval <= 0:
+        raise ValueError("OCR 采样间隔必须大于 0")
+    try:
+        from rapidocr import LangRec, ModelType, OCRVersion, RapidOCR
+    except ImportError:
+        _die("未安装 OCR 组件，请运行: pip install rapidocr onnxruntime")
+
+    frames_dir = work_dir / "ocr_frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    fps = 1.0 / sample_interval
+    frame_pattern = frames_dir / "frame_%06d.jpg"
+    _run(
+        [
+            _get_ffmpeg_path(), "-y",
+            "-i", str(video_path),
+            "-vf", f"fps={fps:.6f},scale='min(1920,iw)':-2",
+            "-q:v", "3",
+            str(frame_pattern),
+        ],
+        "提取 OCR 采样画面",
+    )
+
+    paths = sorted(frames_dir.glob("frame_*.jpg"))
+    if not paths:
+        return []
+    print("    正在加载日文 OCR 模型...")
+    engine = RapidOCR(params={
+        "Det.model_type": ModelType.SMALL,
+        "Det.ocr_version": OCRVersion.PPOCRV6,
+        "Rec.lang_type": LangRec.JAPAN,
+        "Rec.model_type": ModelType.SMALL,
+        "Rec.ocr_version": OCRVersion.PPOCRV6,
+    })
+
+    frames: list[OcrFrame] = []
+    total = len(paths)
+    for index, path in enumerate(paths):
+        result = engine(str(path))
+        texts = []
+        confidences = []
+        for text, confidence in zip(result.txts or (), result.scores or ()):
+            cleaned = str(text).strip()
+            if not cleaned or float(confidence) < 0.35:
+                continue
+            texts.append(cleaned)
+            confidences.append(round(float(confidence), 4))
+        frames.append(OcrFrame(
+            time=round(index * sample_interval, 3),
+            texts=tuple(texts),
+            confidences=tuple(confidences),
+        ))
+        if (index + 1) % 10 == 0 or index + 1 == total:
+            print(f"    OCR 扫描进度: {index + 1}/{total}", flush=True)
+    return frames
 
 
 def _normalize_latin_anchor(text: str) -> str:
@@ -919,6 +1350,8 @@ def save_alignment_report(
         for item in matched
         if item.word_probability is not None
     ]
+    ocr_anchors = [item for item in aligned if item.ocr_score is not None]
+    ocr_scores = [item.ocr_score for item in ocr_anchors if item.ocr_score is not None]
     if any(item.status == "latin_anchor" for item in aligned):
         mode = "latin_anchor"
     elif any(item.source_text for item in aligned):
@@ -941,6 +1374,14 @@ def save_alignment_report(
             if word_probabilities else None
         ),
         "minimum_match_score": effective_minimum,
+        "ocr_assisted": bool(ocr_anchors),
+        "ocr_anchor_lines": len(ocr_anchors),
+        "ocr_anchor_coverage": (
+            round(len(ocr_anchors) / len(aligned), 4) if aligned else 0.0
+        ),
+        "average_ocr_score": (
+            round(sum(ocr_scores) / len(ocr_scores), 2) if ocr_scores else None
+        ),
         "needs_review": [
             index
             for index, item in enumerate(aligned, 1)
@@ -948,7 +1389,7 @@ def save_alignment_report(
         ],
     }
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "summary": summary,
         "items": [
             {"index": index, **asdict(item)}
@@ -967,6 +1408,11 @@ def save_alignment_report(
         )
     else:
         print("    ⚠️  未提供可匹配的日文歌词，全部时间轴均为低置信度回退。")
+    if ocr_anchors:
+        print(
+            f"    OCR 辅助覆盖率: {summary['ocr_anchor_coverage'] * 100:.1f}%"
+            f"，平均分: {summary['average_ocr_score']}"
+        )
     return summary
 
 
@@ -1014,6 +1460,59 @@ def _file_fingerprint(path: Path) -> dict:
         "mtime_ns": stat.st_mtime_ns,
     }
     return result
+
+
+def _ocr_metadata(video_path: Path, sample_interval: float) -> dict:
+    return {
+        "schema_version": OCR_CACHE_SCHEMA,
+        "profile": "rapidocr-ppocrv6-japan-full-frame-v1",
+        "sample_interval": sample_interval,
+        "video": _file_fingerprint(video_path),
+    }
+
+
+def save_ocr_cache(path: Path, frames: list[OcrFrame], metadata: dict) -> None:
+    payload = {
+        "metadata": metadata,
+        "frames": [
+            {
+                "time": frame.time,
+                "texts": list(frame.texts),
+                "confidences": list(frame.confidences),
+            }
+            for frame in frames
+        ],
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    print(f"    OCR 扫描缓存已保存: {path}")
+
+
+def load_ocr_cache(path: Path, expected_metadata: dict) -> Optional[list[OcrFrame]]:
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if payload.get("metadata") != expected_metadata:
+            print("    已有 OCR 缓存与当前视频或设置不一致，将重新扫描。")
+            return None
+        frames = [
+            OcrFrame(
+                time=float(frame["time"]),
+                texts=tuple(str(text) for text in frame.get("texts", [])),
+                confidences=tuple(
+                    float(value) for value in frame.get("confidences", [])
+                ),
+            )
+            for frame in payload.get("frames", [])
+        ]
+        if frames:
+            print(f"    复用 OCR 扫描缓存，共 {len(frames)} 帧")
+            return frames
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"    OCR 缓存读取失败，将重新扫描: {error}")
+    return None
 
 
 def _transcript_metadata(
@@ -1099,6 +1598,9 @@ def process_single(
     audio_source: str = "vocals",
     model_name: str = DEFAULT_WHISPER_MODEL,
     min_match_score: float = DEFAULT_MIN_MATCH_SCORE,
+    ocr_assist: bool = False,
+    refresh_ocr: bool = False,
+    ocr_sample_interval: float = DEFAULT_OCR_SAMPLE_INTERVAL,
 ) -> None:
     """处理单个视频文件。"""
     video_path  = Path(video_path)
@@ -1115,11 +1617,12 @@ def process_single(
         raise ValueError(f"不支持的 Whisper 模型: {model_name}")
 
     _banner(f"处理: {video_path.name}")
+    total_steps = 8 if ocr_assist else 7
 
     with tempfile.TemporaryDirectory(prefix="subtitle_sync_") as _tmpdir:
         tmpdir = Path(_tmpdir)
 
-        _step(1, 7, "加载歌词")
+        _step(1, total_steps, "加载歌词")
         _ja_prompt, lyric_lines = load_lyrics(lyrics_path)
 
         cache_path = output_path.with_suffix(".whisper.json")
@@ -1132,18 +1635,18 @@ def process_single(
         segments = None if refresh_transcript else load_transcript_cache(cache_path, metadata)
 
         if segments is None:
-            _step(2, 7, "提取音频")
+            _step(2, total_steps, "提取音频")
             audio_wav = tmpdir / "audio.wav"
             extract_audio(video_path, audio_wav)
 
             if audio_source == "vocals":
-                _step(3, 7, "Demucs 人声分离")
+                _step(3, total_steps, "Demucs 人声分离")
                 transcription_audio = separate_vocals(audio_wav, tmpdir)
             else:
-                _step(3, 7, "使用原始混合音频（跳过 Demucs）")
+                _step(3, total_steps, "使用原始混合音频（跳过 Demucs）")
                 transcription_audio = audio_wav
 
-            _step(4, 7, f"Whisper {model_name} 日语识别")
+            _step(4, total_steps, f"Whisper {model_name} 日语识别")
             segments = transcribe_audio(
                 transcription_audio,
                 model_name=model_name,
@@ -1151,32 +1654,62 @@ def process_single(
             )
             save_transcript_cache(cache_path, segments, metadata)
         else:
-            _step(2, 7, "复用 Whisper 缓存，跳过音频提取")
-            _step(3, 7, "复用 Whisper 缓存，跳过人声分离")
-            _step(4, 7, "复用 Whisper 缓存，跳过识别")
+            _step(2, total_steps, "复用 Whisper 缓存，跳过音频提取")
+            _step(3, total_steps, "复用 Whisper 缓存，跳过人声分离")
+            _step(4, total_steps, "复用 Whisper 缓存，跳过识别")
 
-        _step(5, 7, "文本驱动时间轴映射")
+        _step(5, total_steps, "文本驱动时间轴映射")
         aligned = align_lyrics_to_segments(
             segments,
             lyric_lines,
             min_match_score=min_match_score,
         )
 
+        ocr_cache_path = None
+        if ocr_assist:
+            ocr_cache_path = output_path.with_suffix(".ocr.json")
+            ocr_metadata = _ocr_metadata(video_path, ocr_sample_interval)
+            ocr_frames = None if refresh_ocr else load_ocr_cache(
+                ocr_cache_path,
+                ocr_metadata,
+            )
+            if ocr_frames is None:
+                _step(6, total_steps, "扫描画面歌词")
+                ocr_frames = scan_video_ocr(
+                    video_path,
+                    tmpdir,
+                    sample_interval=ocr_sample_interval,
+                )
+                save_ocr_cache(ocr_cache_path, ocr_frames, ocr_metadata)
+            else:
+                _step(6, total_steps, "复用 OCR 缓存，跳过画面扫描")
+            ocr_anchors = build_ocr_line_anchors(
+                ocr_frames,
+                lyric_lines,
+                aligned,
+            )
+            aligned = apply_ocr_timing_assist(aligned, ocr_anchors)
+
         # 生成 SRT（始终保存到输出视频同目录）
         srt_path = output_path.with_suffix(".srt")
         generate_srt(aligned, srt_path)
 
-        _step(6, 7, "生成对轴置信度报告")
+        report_step = 7 if ocr_assist else 6
+        _step(report_step, total_steps, "生成对轴置信度报告")
         report_path = output_path.with_suffix(".alignment.json")
         summary = save_alignment_report(aligned, report_path, min_match_score)
 
-        if summary["mode"] == "text_dp" and summary["matched_coverage"] < 0.5:
+        if (
+            summary["mode"] == "text_dp"
+            and summary["matched_coverage"] < 0.5
+            and not summary["ocr_assisted"]
+        ):
             print("    ⚠️  文本锚点覆盖率低于 50%，建议先检查 alignment.json 和 SRT。")
 
         if no_burn:
-            _step(7, 7, "仅生成 SRT，跳过视频烧录")
+            _step(total_steps, total_steps, "仅生成 SRT，跳过视频烧录")
         else:
-            _step(7, 7, "FFmpeg 烧入硬字幕")
+            _step(total_steps, total_steps, "FFmpeg 烧入硬字幕")
             burn_subtitles(video_path, srt_path, output_path)
 
     print()
@@ -1187,6 +1720,8 @@ def process_single(
     print(f"  📄 SRT 文件: {srt_path}")
     print(f"  📊 对轴报告: {report_path}")
     print(f"  ♻️  转录缓存: {cache_path}")
+    if ocr_cache_path is not None:
+        print(f"  👁️  画面文字缓存: {ocr_cache_path}")
     print()
 
 
@@ -1200,6 +1735,9 @@ def process_batch(
     audio_source: str = "vocals",
     model_name: str = DEFAULT_WHISPER_MODEL,
     min_match_score: float = DEFAULT_MIN_MATCH_SCORE,
+    ocr_assist: bool = False,
+    refresh_ocr: bool = False,
+    ocr_sample_interval: float = DEFAULT_OCR_SAMPLE_INTERVAL,
 ) -> None:
     """批量处理目录下的所有视频文件。"""
     video_dir  = Path(video_dir)
@@ -1239,6 +1777,9 @@ def process_batch(
                 audio_source=audio_source,
                 model_name=model_name,
                 min_match_score=min_match_score,
+                ocr_assist=ocr_assist,
+                refresh_ocr=refresh_ocr,
+                ocr_sample_interval=ocr_sample_interval,
             )
         except Exception as e:
             print(f"  ❌ 处理 {video_path.name} 时出错: {e}")
@@ -1386,6 +1927,16 @@ def main() -> None:
         default=DEFAULT_MIN_MATCH_SCORE,
         help=f"日文文本锚点最低相似度（默认: {DEFAULT_MIN_MATCH_SCORE:.0f}）",
     )
+    parser.add_argument(
+        "--ocr-assist",
+        action="store_true",
+        help="用视频画面中的歌词或硬字幕辅助校正时间轴",
+    )
+    parser.add_argument(
+        "--refresh-ocr",
+        action="store_true",
+        help="忽略已有 OCR 缓存并重新扫描画面",
+    )
 
     # ── 批量模式 ──────────────────────────────────────────────────
     parser.add_argument("--batch",      action="store_true", help="启用批量处理模式")
@@ -1411,6 +1962,8 @@ def main() -> None:
             audio_source=args.audio_source,
             model_name=args.model,
             min_match_score=args.min_match_score,
+            ocr_assist=args.ocr_assist,
+            refresh_ocr=args.refresh_ocr,
         )
     else:
         if not args.video or not args.lyrics:
@@ -1425,6 +1978,8 @@ def main() -> None:
             audio_source=args.audio_source,
             model_name=args.model,
             min_match_score=args.min_match_score,
+            ocr_assist=args.ocr_assist,
+            refresh_ocr=args.refresh_ocr,
         )
 
 

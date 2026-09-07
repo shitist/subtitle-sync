@@ -23,6 +23,7 @@ dist/
 *.srt
 *.alignment.json
 *.whisper.json
+*.ocr.json
 
 # Reproducible packaged binary
 release/*.exe

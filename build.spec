@@ -32,6 +32,7 @@ a = Analysis(
         "numpy",
         "ctranslate2",
         "onnxruntime",
+        "rapidocr",
         "soundfile",
         "av",
         "pandas",

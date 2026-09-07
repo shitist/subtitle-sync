@@ -12,7 +12,7 @@
 2. 双击 `SubtitleSync.exe` 打开界面，无需安装或解压。
 3. 拖入视频和歌词，选择模型与处理方式后开始。
 
-Release 中的 EXE 已包含图形界面和核心脚本，但不包含 Whisper、Demucs 和语音模型。电脑仍需安装 Python 3.10+ 及识别依赖。第一次使用某个语音模型时会自动联网下载；之后会直接使用本机缓存。
+Release 中的 EXE 已包含图形界面和核心脚本，但不包含 Whisper、Demucs、OCR 运行库和语音模型。电脑仍需安装 Python 3.10+ 及识别依赖。第一次使用某个语音模型时会自动联网下载；之后会直接使用本机缓存。
 
 如果运行环境不完整，程序会在处理前列出缺少的组件和安装命令。日常使用不需要通过命令行启动界面。
 
@@ -35,6 +35,7 @@ python subtitle_sync_gui.py
 - 日语歌曲、MV、Live 等音乐视频。推荐提供行数对应的中文与日文歌词。
 - 访谈、解说、Vlog、动画对白等非音乐视频。语音清楚时通常比歌曲更容易识别。
 - 已经有逐行中文字幕，只需要生成 SRT 时间轴或烧入视频。
+- 画面本身带有日文歌词或硬字幕的视频，可选用 OCR 画面歌词辅助校准。
 - 先自动生成初稿，再结合 `alignment.json` 和播放器进行人工复核。
 
 局限：
@@ -44,6 +45,7 @@ python subtitle_sync_gui.py
 - 识别语言固定为日语。Whisper 本身支持其他语言，但其他语言的歌词解析与匹配效果尚未经过实测。
 - 歌唱、和声、多人重叠、现场噪声、混响和重伴奏都会降低识别与文本锚点覆盖率。
 - 没有匹配到的歌词行会在相邻锚点之间补时间，不能保证达到逐帧精度；锚点覆盖率低时必须复核。
+- OCR 只能利用视频里确实存在的可读文字；无画面歌词、纯装饰文字、严重旋转或故意提前/延后的歌词可能无效或产生误差。
 - 不处理说话人区分、字幕断句改写、翻译、特效字幕或复杂排版。
 
 非音乐视频通常直接选择“原始音频”即可；“分离人声”主要用于伴奏较重的歌曲，MV等场景推荐分离人声。
@@ -80,6 +82,7 @@ python subtitle_sync_gui.py
      → faster-whisper 所选模型逐词识别
      → 日文歌词与识别文本进行顺序受限匹配
      → 高分匹配作为时间锚点，漏识别行在相邻锚点间局部补齐
+     → 可选 OCR 扫描画面歌词，校正局部漂移和明显错位边界
      → SRT + 对轴报告 → 可选 FFmpeg 硬字幕烧入
 ```
 
@@ -89,6 +92,7 @@ python subtitle_sync_gui.py
 
 - Python 3.10+
 - FFmpeg（推荐加入系统 `PATH`）
+- 使用画面歌词辅助时需要 RapidOCR 与 ONNX Runtime（已列入 `requirements.txt`）
 - 首次使用所选模型时需要联网自动下载
 - 模型越大，对内存或显存的要求越高
 
@@ -147,12 +151,13 @@ pip install -r requirements.txt
 - Demucs 人声或原始混合音频
 - 仅生成 SRT
 - 强制重新运行 Whisper
+- 可选的 OCR 画面歌词辅助校准
 - 启用或禁用 VAD
 - 固定显示当前阶段、进度条和已运行时间
 
 界面只显示阶段、匹配摘要和输出路径。Whisper 的逐段识别文字仍会保存在完整日志中，不再占满窗口。
 
-GUI 启动处理前会扫描项目虚拟环境、`PATH` 和 Windows Python Launcher 注册的解释器，并逐一检查 Python 版本及 `faster_whisper`、`rapidfuzz`、`demucs` 等模块。选择 Demucs 人声时，缺少 `demucs` 的解释器不会被采用；没有合格环境时会在提取音频前停止并列出缺失模块。
+GUI 启动处理前会扫描项目虚拟环境、`PATH` 和 Windows Python Launcher 注册的解释器，并逐一检查 Python 版本及 `faster_whisper`、`rapidfuzz`、`demucs` 等模块。选择 Demucs 人声时，缺少 `demucs` 的解释器不会被采用；开启画面歌词辅助时还会检查 `rapidocr` 与 `onnxruntime`。没有合格环境时会在提取音频前停止并列出缺失模块。
 
 可使用环境变量 `SUBTITLE_SYNC_PYTHON` 指定专用解释器。指定环境仍须通过版本和依赖检查。
 
@@ -201,6 +206,14 @@ python subtitle_sync.py --video song.mp4 --lyrics song.txt --model large-v3-turb
 python subtitle_sync.py --video song.mp4 --lyrics song.txt --refresh-transcript
 ```
 
+视频本身带有歌词或硬字幕时，开启画面文字辅助：
+
+```powershell
+python subtitle_sync.py --video song.mp4 --lyrics song.txt --ocr-assist
+```
+
+该模式默认每 0.5 秒扫描一次全画面，首次运行会多花数分钟，并生成 `.ocr.json` 画面文字缓存；之后可直接复用。只有检测到足够多的高分歌词锚点才会修改时间轴，否则自动保留 Whisper 结果。RapidOCR 的模型随 Python 包安装，无需让用户填写模型参数，支持情况见 [RapidOCR 模型列表](https://rapidai.github.io/RapidOCRDocs/main/model_list/)。
+
 调整文本锚点最低相似度：
 
 ```powershell
@@ -228,8 +241,9 @@ python subtitle_sync.py --batch --video-dir ./videos --lyrics-dir ./lyrics
 |---|---|
 | `song_subtitled.mp4` | 烧入硬字幕的视频；使用 `--no-burn` 时不生成 |
 | `song_subtitled.srt` | 始终生成的字幕文件 |
-| `song_subtitled.alignment.json` | 每行时间、匹配文字、文本分数、Whisper 词概率、状态和待检查行 |
+| `song_subtitled.alignment.json` | 每行时间、匹配文字、文本/OCR 分数、Whisper 词概率、状态和待检查行 |
 | `song_subtitled.whisper.json` | Whisper 原始片段与逐词时间缓存 |
+| `song_subtitled.ocr.json` | 开启画面歌词辅助时生成的 OCR 扫描缓存 |
 
 `alignment.json` 中的主要状态：
 
@@ -239,7 +253,7 @@ python subtitle_sync.py --batch --video-dir ./videos --lyrics-dir ./lyrics
 - `interpolated`：Whisper 漏识别，时间由相邻锚点局部补齐
 - `timing_fallback`：没有日文原文，只能按声音边界估算
 
-修改歌词、对轴算法或相似度阈值时可以直接复用 `.whisper.json`，无需重新运行 Demucs 和 Whisper。输入视频、模型、VAD、音源或识别配置变化时缓存会自动失效。
+修改歌词、对轴算法或相似度阈值时可以直接复用 `.whisper.json`，无需重新运行 Demucs 和 Whisper。OCR 扫描结果也会单独复用 `.ocr.json`。输入视频、模型、VAD、音源或识别配置变化时，相应缓存会自动失效。
 
 ## 项目结构
 
@@ -265,7 +279,7 @@ pip install -r requirements-gui.txt
 pyinstaller build.spec
 ```
 
-打包后的 `SubtitleSync.exe` 内置 PySide6 界面，但不内置 Whisper、Demucs 和模型。目标机器仍需安装可用的 Python 3.10+ 及 `requirements.txt` 中的依赖。EXE 会优先使用同目录的 `subtitle_sync.py`，方便更新核心算法。
+打包后的 `SubtitleSync.exe` 内置 PySide6 界面，但不内置 Whisper、Demucs、RapidOCR 运行库和模型。目标机器仍需安装可用的 Python 3.10+ 及 `requirements.txt` 中的依赖。EXE 会优先使用同目录的 `subtitle_sync.py`，方便更新核心算法。
 
 ## 测试
 

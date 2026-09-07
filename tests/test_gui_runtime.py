@@ -169,6 +169,34 @@ class RuntimePresentationTests(unittest.TestCase):
         self.assertEqual(command[command.index("--model") + 1], "large-v3-turbo")
         self.assertIn("--no-burn", command)
 
+    def test_ocr_assist_and_refresh_are_passed_as_guided_options(self):
+        command = gui._build_processing_command(
+            "python.exe",
+            {
+                "mode": "single",
+                "video": "song.mp4",
+                "lyrics": "song.txt",
+                "output": "",
+                "audio_source": "original",
+                "model": "large-v3",
+                "no_vad": False,
+                "no_burn": True,
+                "refresh": True,
+                "ocr_assist": True,
+            },
+        )
+
+        self.assertIn("--ocr-assist", command)
+        self.assertIn("--refresh-ocr", command)
+
+    def test_ocr_stage_and_frame_progress_are_presented(self):
+        stage = gui.parse_runtime_line("[6/8] 扫描画面歌词...")
+        progress = gui.parse_runtime_line("OCR 扫描进度: 25/100")
+
+        self.assertEqual(stage["progress"], 55)
+        self.assertEqual(progress["kind"], "ocr_progress")
+        self.assertEqual(progress["progress"], 63)
+
 
 if __name__ == "__main__":
     unittest.main()
