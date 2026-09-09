@@ -112,6 +112,8 @@ class AlignmentItem:
     ocr_text: str = ""
     ocr_score: Optional[float] = None
     ocr_shift: Optional[float] = None
+    ocr_target_coverage: Optional[float] = None
+    review_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -134,6 +136,7 @@ class OcrLineAnchor:
     recognized_text: str
     score: float
     target_fraction: float
+    target_coverage: float = 1.0
     visual_start: Optional[float] = None
     visual_end: Optional[float] = None
     sample_count: int = 1
@@ -559,17 +562,17 @@ def _score_ocr_candidate(
     target: str,
     observed: str,
     confidence: float,
-) -> tuple[float, float]:
-    """返回 OCR 片段匹配分和该片段在歌词中的相对位置。"""
+) -> tuple[float, float, float]:
+    """返回 OCR 匹配分、片段中心位置和目标歌词覆盖率。"""
     normalized_target = _normalize_japanese(target)
     normalized_observed = _normalize_japanese(observed)
     if len(normalized_target) < 3 or len(normalized_observed) < 3:
-        return 0.0, 0.5
+        return 0.0, 0.5, 0.0
 
     matcher = SequenceMatcher(None, normalized_target, normalized_observed)
     block = max(matcher.get_matching_blocks(), key=lambda item: item.size)
     if block.size < 3:
-        return 0.0, 0.5
+        return 0.0, 0.5, 0.0
 
     try:
         from rapidfuzz.fuzz import partial_ratio
@@ -589,24 +592,117 @@ def _score_ocr_candidate(
     target_fraction = (
         block.a + block.size / 2.0
     ) / len(normalized_target)
-    return round(score, 2), max(0.0, min(1.0, target_fraction))
+    target_coverage = block.size / len(normalized_target)
+    return (
+        round(score, 2),
+        max(0.0, min(1.0, target_fraction)),
+        max(0.0, min(1.0, target_coverage)),
+    )
 
 
 def _match_ocr_frame(
     target: str,
     frame: OcrFrame,
-) -> tuple[float, str, float]:
+) -> tuple[float, str, float, float]:
     """找出一帧 OCR 结果中与目标歌词最接近的连续文本。"""
-    best = (0.0, "", 0.5)
+    best = (0.0, "", 0.5, 0.0)
     for candidate, confidence in _ocr_text_candidates(frame):
-        score, target_fraction = _score_ocr_candidate(
+        score, target_fraction, target_coverage = _score_ocr_candidate(
             target,
             candidate,
             confidence,
         )
         if score > best[0]:
-            best = (score, candidate, target_fraction)
+            best = (score, candidate, target_fraction, target_coverage)
     return best
+
+
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _duration_profile(
+    baseline: list[AlignmentItem],
+    line_index: int,
+) -> tuple[float, float, float]:
+    """用邻近行的中位数与 MAD 给出正常时长和异常值边界。"""
+    durations = [
+        max(0.08, item.end - item.start)
+        for item in baseline
+    ]
+    if not durations:
+        return 2.0, 0.5, 4.0
+
+    peers = [
+        duration
+        for index, duration in enumerate(durations)
+        if index != line_index and abs(index - line_index) <= 4
+    ]
+    if len(peers) < 3:
+        peers = [
+            duration
+            for index, duration in enumerate(durations)
+            if index != line_index
+        ]
+    if not peers:
+        typical = durations[line_index]
+        return typical, max(0.08, typical / 2.0), typical * 2.0
+
+    typical = _median(peers)
+    mad = _median([abs(duration - typical) for duration in peers])
+    tolerance = max(
+        typical * 0.5,
+        3.0 * 1.4826 * mad,
+        DEFAULT_OCR_SAMPLE_INTERVAL * 2.0,
+    )
+    return (
+        typical,
+        max(0.08, typical - tolerance),
+        typical + tolerance,
+    )
+
+
+def _is_wide_duration_outlier(
+    item: AlignmentItem,
+    anchor: OcrLineAnchor,
+    duration_profile: tuple[float, float, float],
+) -> bool:
+    """只接受统计与画面跨度同时证明的异常长区间。"""
+    if anchor.visual_start is None or anchor.visual_end is None:
+        return False
+    typical_duration, _lower_duration, upper_duration = duration_profile
+    baseline_duration = item.end - item.start
+    visual_duration = anchor.visual_end - anchor.visual_start
+    supported_duration = max(typical_duration, visual_duration)
+    return (
+        baseline_duration > upper_duration
+        and baseline_duration >= supported_duration * 2.0
+    )
+
+
+def _classify_ocr_anchor_conflicts(
+    anchors: list[OcrLineAnchor],
+    sample_interval: float,
+) -> tuple[set[int], set[int]]:
+    """区分确定的时间倒序与可能合法的同屏重复句。"""
+    hard_conflicts: set[int] = set()
+    for left, right in zip(anchors, anchors[1:]):
+        if right.time < left.time:
+            hard_conflicts.update((left.line_index, right.line_index))
+
+    repeated_frame_conflicts: set[int] = set()
+    last_by_lyric: dict[str, OcrLineAnchor] = {}
+    for anchor in anchors:
+        normalized = _normalize_japanese(anchor.source_text)
+        previous = last_by_lyric.get(normalized)
+        if previous and anchor.time - previous.time < sample_interval:
+            repeated_frame_conflicts.update((previous.line_index, anchor.line_index))
+        last_by_lyric[normalized] = anchor
+    return hard_conflicts, repeated_frame_conflicts
 
 
 def build_ocr_line_anchors(
@@ -620,6 +716,17 @@ def build_ocr_line_anchors(
     if len(lyric_lines) != len(baseline):
         raise ValueError("OCR 辅助要求歌词行数与基础时间轴一致")
 
+    frame_intervals = [
+        frames[index].time - frames[index - 1].time
+        for index in range(1, len(frames))
+        if frames[index].time > frames[index - 1].time
+    ]
+    sample_interval = (
+        _median(frame_intervals)
+        if frame_intervals
+        else DEFAULT_OCR_SAMPLE_INTERVAL
+    )
+
     anchors: list[OcrLineAnchor] = []
     for line_index, (line, item) in enumerate(zip(lyric_lines, baseline)):
         # 尖括号通常是和声或画面附注，不把它抢到的高分当成主句锚点。
@@ -628,18 +735,27 @@ def build_ocr_line_anchors(
             continue
 
         duration = max(0.2, item.end - item.start)
+        typical_duration, _lower_duration, upper_duration = _duration_profile(
+            baseline,
+            line_index,
+        )
+        # 只有远超统计上界的粗轴才放宽搜索；普通长句仍沿用局部时间先验。
+        anomalously_long = duration > upper_duration + typical_duration
         candidates = []
         for frame in frames:
             if frame.time < item.start - max_shift_seconds:
                 continue
             if frame.time > item.end + max_shift_seconds:
                 break
-            score, recognized, target_fraction = _match_ocr_frame(target, frame)
+            score, recognized, target_fraction, target_coverage = _match_ocr_frame(
+                target,
+                frame,
+            )
             if score < min_match_score:
                 continue
             expected_time = item.start + duration * target_fraction
             delta = frame.time - expected_time
-            if abs(delta) > max_shift_seconds:
+            if abs(delta) > max_shift_seconds and not anomalously_long:
                 continue
             rank = score - abs(delta) * 1.5
             candidates.append({
@@ -647,6 +763,7 @@ def build_ocr_line_anchors(
                 "score": score,
                 "recognized": recognized,
                 "target_fraction": target_fraction,
+                "target_coverage": target_coverage,
                 "delta": delta,
                 "rank": rank,
             })
@@ -654,16 +771,6 @@ def build_ocr_line_anchors(
         if not candidates:
             continue
 
-        frame_intervals = [
-            frames[index].time - frames[index - 1].time
-            for index in range(1, len(frames))
-            if frames[index].time > frames[index - 1].time
-        ]
-        sample_interval = (
-            sorted(frame_intervals)[len(frame_intervals) // 2]
-            if frame_intervals
-            else DEFAULT_OCR_SAMPLE_INTERVAL
-        )
         groups: list[list[dict]] = []
         for candidate in candidates:
             if (
@@ -674,14 +781,22 @@ def build_ocr_line_anchors(
                 groups.append([candidate])
             else:
                 groups[-1].append(candidate)
-        best_group = max(
-            groups,
-            key=lambda group: (
+        def group_rank(group: list[dict]) -> float:
+            quality = (
                 max(candidate["score"] for candidate in group)
                 + min(len(group), 10) * 4.0
-                - min(abs(candidate["delta"]) for candidate in group)
-            ),
-        )
+            )
+            if anomalously_long:
+                visual_start = group[0]["frame"].time - sample_interval / 2.0
+                visual_end = group[-1]["frame"].time + sample_interval / 2.0
+                edge_distance = min(
+                    abs(visual_start - item.start),
+                    abs(visual_end - item.end),
+                )
+                return quality - edge_distance
+            return quality - min(abs(candidate["delta"]) for candidate in group)
+
+        best_group = max(groups, key=group_rank)
         best = max(best_group, key=lambda candidate: candidate["rank"])
         nearby = [
             candidate
@@ -711,6 +826,7 @@ def build_ocr_line_anchors(
             recognized_text=best["recognized"],
             score=round(best["score"], 2),
             target_fraction=round(best["target_fraction"], 4),
+            target_coverage=round(best["target_coverage"], 4),
             visual_start=(
                 round(best_group[0]["frame"].time - sample_interval / 2.0, 3)
                 if len(best_group) >= 2
@@ -741,11 +857,81 @@ def apply_ocr_timing_assist(
         return baseline
 
     anchor_map = {anchor.line_index: anchor for anchor in anchors}
-    anchor_indices = sorted(anchor_map)
+    hard_conflicts, repeated_frame_conflicts = _classify_ocr_anchor_conflicts(
+        anchors,
+        DEFAULT_OCR_SAMPLE_INTERVAL,
+    )
+    if hard_conflicts:
+        print("    OCR 锚点出现时间倒序，已保留原有 Whisper 时间轴并标记复核。")
+        return [
+            replace(
+                item,
+                ocr_text=anchor_map[index].recognized_text if index in anchor_map else "",
+                ocr_score=anchor_map[index].score if index in anchor_map else None,
+                ocr_shift=0.0 if index in anchor_map else None,
+                ocr_target_coverage=(
+                    anchor_map[index].target_coverage if index in anchor_map else None
+                ),
+                review_reason=(
+                    "ocr_sequence_conflict" if index in hard_conflicts else ""
+                ),
+            )
+            for index, item in enumerate(baseline)
+        ]
+    review_reasons: dict[int, str] = {
+        index: "ocr_repeated_frame"
+        for index in repeated_frame_conflicts
+    }
+    duration_profiles = [
+        _duration_profile(baseline, index)
+        for index in range(line_count)
+    ]
+    partial_directions: dict[int, str] = {}
+    anchor_shifts: dict[int, float] = {}
+    for index, anchor in anchor_map.items():
+        item = baseline[index]
+        _typical_duration, lower_duration, _upper_duration = duration_profiles[index]
+        baseline_duration = item.end - item.start
+        has_visual_span = (
+            anchor.visual_start is not None and anchor.visual_end is not None
+        )
+        if _is_wide_duration_outlier(
+            item,
+            anchor,
+            duration_profiles[index],
+        ):
+            start_distance = abs(anchor.visual_start - item.start)
+            end_distance = abs(anchor.visual_end - item.end)
+            anchor_shifts[index] = (
+                anchor.visual_start - item.start
+                if start_distance <= end_distance
+                else anchor.visual_end - item.end
+            )
+            continue
+        if (
+            has_visual_span
+            and baseline_duration < lower_duration
+            and anchor.target_coverage < 0.75
+        ):
+            if (
+                anchor.visual_start > item.end + DEFAULT_OCR_SAMPLE_INTERVAL
+                and anchor.target_fraction > 0.5
+            ):
+                partial_directions[index] = "tail"
+                continue
+            if (
+                anchor.visual_end < item.start - DEFAULT_OCR_SAMPLE_INTERVAL
+                and anchor.target_fraction < 0.5
+            ):
+                partial_directions[index] = "head"
+                continue
+        anchor_shifts[index] = anchor.delta
+
+    anchor_indices = sorted(anchor_shifts)
     shifts: list[float] = []
     for index in range(line_count):
-        if index in anchor_map:
-            shifts.append(anchor_map[index].delta)
+        if index in anchor_shifts:
+            shifts.append(anchor_shifts[index])
             continue
         left = next((value for value in reversed(anchor_indices) if value < index), None)
         right = next((value for value in anchor_indices if value > index), None)
@@ -756,13 +942,13 @@ def apply_ocr_timing_assist(
             span = max(0.001, right_time - left_time)
             ratio = max(0.0, min(1.0, (current_time - left_time) / span))
             shifts.append(
-                anchor_map[left].delta * (1.0 - ratio)
-                + anchor_map[right].delta * ratio
+                anchor_shifts[left] * (1.0 - ratio)
+                + anchor_shifts[right] * ratio
             )
         elif left is not None and index - left <= 2:
-            shifts.append(anchor_map[left].delta)
+            shifts.append(anchor_shifts[left])
         elif right is not None and right - index <= 2:
-            shifts.append(anchor_map[right].delta)
+            shifts.append(anchor_shifts[right])
         else:
             shifts.append(0.0)
 
@@ -802,6 +988,8 @@ def apply_ocr_timing_assist(
         right_anchor = anchor_map.get(index + 1)
         if not left_anchor or not right_anchor:
             continue
+        if index in partial_directions or index + 1 in partial_directions:
+            continue
         if (
             left_anchor.visual_end is None
             or right_anchor.visual_start is None
@@ -818,6 +1006,86 @@ def apply_ocr_timing_assist(
         ends[index] = left_anchor.visual_end
         starts[index + 1] = right_anchor.visual_start
         visual_boundary_corrections += 1
+
+    duration_corrections = 0
+    for index, item in enumerate(baseline):
+        anchor = anchor_map.get(index)
+        if (
+            not anchor
+            or anchor.visual_start is None
+            or anchor.visual_end is None
+            or anchor.sample_count < 2
+        ):
+            continue
+        typical_duration, _lower_duration, _upper_duration = duration_profiles[index]
+        baseline_duration = item.end - item.start
+        if not _is_wide_duration_outlier(
+            item,
+            anchor,
+            duration_profiles[index],
+        ):
+            continue
+
+        visual_span = anchor.visual_end - anchor.visual_start
+        estimated_duration = max(typical_duration, visual_span)
+        if baseline_duration <= estimated_duration + DEFAULT_OCR_SAMPLE_INTERVAL:
+            continue
+
+        start_distance = abs(anchor.visual_start - item.start)
+        end_distance = abs(anchor.visual_end - item.end)
+        if start_distance <= end_distance:
+            estimated_start = anchor.visual_start
+            estimated_end = max(
+                anchor.visual_end,
+                estimated_start + estimated_duration,
+            )
+        else:
+            estimated_end = anchor.visual_end
+            estimated_start = min(
+                anchor.visual_start,
+                estimated_end - estimated_duration,
+            )
+        minimum_duration = min(0.5, max(0.08, baseline_duration))
+        if index > 0:
+            estimated_start = max(estimated_start, ends[index - 1])
+        if index + 1 < line_count:
+            estimated_end = min(estimated_end, starts[index + 1])
+        if estimated_end - estimated_start < minimum_duration:
+            continue
+
+        starts[index] = estimated_start
+        ends[index] = estimated_end
+        review_reasons[index] = "ocr_duration_outlier"
+        duration_corrections += 1
+
+    partial_span_corrections = 0
+    for index, direction in partial_directions.items():
+        anchor = anchor_map[index]
+        typical_duration = duration_profiles[index][0]
+        if direction == "tail":
+            estimated_end = max(
+                anchor.visual_end,
+                anchor.time + typical_duration * (1.0 - anchor.target_fraction),
+            )
+            if index + 1 < line_count:
+                estimated_end = min(estimated_end, starts[index + 1])
+            if estimated_end > ends[index]:
+                ends[index] = estimated_end
+            else:
+                continue
+        else:
+            estimated_start = min(
+                anchor.visual_start,
+                anchor.time - typical_duration * anchor.target_fraction,
+            )
+            if index > 0:
+                estimated_start = max(estimated_start, ends[index - 1])
+            if estimated_start < starts[index]:
+                starts[index] = estimated_start
+            else:
+                continue
+        review_reasons[index] = "ocr_partial_span"
+        partial_span_corrections += 1
 
     # 极短的 Okay / C'mon 等行容易被两侧不同的修正量挤扁。
     # 局部移动两侧边界，至少保留原长度或 0.5 秒中的较小值。
@@ -850,13 +1118,18 @@ def apply_ocr_timing_assist(
     corrected = []
     for index, item in enumerate(baseline):
         anchor = anchor_map.get(index)
+        applied_shift = (
+            starts[index] + ends[index] - item.start - item.end
+        ) / 2.0
         corrected.append(replace(
             item,
             start=round(starts[index], 3),
             end=round(ends[index], 3),
             ocr_text=anchor.recognized_text if anchor else "",
             ocr_score=anchor.score if anchor else None,
-            ocr_shift=round(shifts[index], 3),
+            ocr_shift=round(applied_shift, 3),
+            ocr_target_coverage=anchor.target_coverage if anchor else None,
+            review_reason=review_reasons.get(index, ""),
         ))
     print(
         f"    OCR 画面锚点: {len(anchors)}/{line_count} 行，"
@@ -864,6 +1137,10 @@ def apply_ocr_timing_assist(
     )
     if visual_boundary_corrections:
         print(f"    OCR 修正明显错位边界: {visual_boundary_corrections} 处。")
+    if duration_corrections:
+        print(f"    OCR 修正异常时长: {duration_corrections} 行。")
+    if partial_span_corrections:
+        print(f"    OCR 合并单侧片段: {partial_span_corrections} 行。")
     return corrected
 
 
@@ -1385,8 +1662,13 @@ def save_alignment_report(
         "needs_review": [
             index
             for index, item in enumerate(aligned, 1)
-            if item.status != "matched"
+            if item.status != "matched" or item.review_reason
         ],
+        "review_reasons": {
+            str(index): item.review_reason
+            for index, item in enumerate(aligned, 1)
+            if item.review_reason
+        },
     }
     payload = {
         "schema_version": 2,

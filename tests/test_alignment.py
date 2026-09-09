@@ -12,6 +12,7 @@ from subtitle_sync import (
     WordTiming,
     _ocr_metadata,
     _normalize_japanese,
+    _classify_ocr_anchor_conflicts,
     _transcript_metadata,
     apply_ocr_timing_assist,
     align_lyrics_to_segments,
@@ -190,6 +191,61 @@ class TextAlignmentTests(unittest.TestCase):
 
 
 class OcrAssistanceTests(unittest.TestCase):
+    def test_global_ocr_order_detects_backward_anchors(self):
+        anchors = [
+            OcrLineAnchor(0, 10.0, 0.0, "第一句", "第一句", 99.0, 0.5),
+            OcrLineAnchor(1, 20.0, 0.0, "第二句", "第二句", 99.0, 0.5),
+            OcrLineAnchor(2, 15.0, 0.0, "第三句", "第三句", 85.0, 0.5),
+        ]
+
+        hard, repeated = _classify_ocr_anchor_conflicts(anchors, 0.5)
+
+        self.assertEqual(hard, {1, 2})
+        self.assertEqual(repeated, set())
+
+    def test_global_ocr_order_allows_distinct_lines_on_the_same_frame(self):
+        anchors = [
+            OcrLineAnchor(0, 10.0, 0.0, "第一句", "第一句", 99.0, 0.5),
+            OcrLineAnchor(1, 10.0, 0.0, "第二句", "第二句", 99.0, 0.5),
+        ]
+
+        hard, repeated = _classify_ocr_anchor_conflicts(anchors, 0.5)
+
+        self.assertEqual(hard, set())
+        self.assertEqual(repeated, set())
+
+    def test_global_ocr_order_does_not_reuse_one_frame_for_repeated_lyrics(self):
+        anchors = [
+            OcrLineAnchor(0, 10.0, 0.0, "同じ歌詞", "同じ歌詞", 99.0, 0.5),
+            OcrLineAnchor(1, 10.0, 0.0, "同じ歌詞", "同じ歌詞", 85.0, 0.5),
+        ]
+
+        hard, repeated = _classify_ocr_anchor_conflicts(anchors, 0.5)
+
+        self.assertEqual(hard, set())
+        self.assertEqual(repeated, {0, 1})
+
+    def test_backward_ocr_sequence_falls_back_without_moving_timing(self):
+        baseline = [
+            AlignmentItem(0.0, 4.0, "第一行"),
+            AlignmentItem(4.0, 8.0, "第二行"),
+            AlignmentItem(8.0, 12.0, "第三行"),
+        ]
+        anchors = [
+            OcrLineAnchor(0, 10.0, 10.0, "第一句", "第一句", 99.0, 0.5),
+            OcrLineAnchor(1, 20.0, 16.0, "第二句", "第二句", 99.0, 0.5),
+            OcrLineAnchor(2, 15.0, 7.0, "第三句", "第三句", 99.0, 0.5),
+        ]
+
+        corrected = apply_ocr_timing_assist(baseline, anchors)
+
+        self.assertEqual(
+            [(item.start, item.end) for item in corrected],
+            [(item.start, item.end) for item in baseline],
+        )
+        self.assertEqual(corrected[1].review_reason, "ocr_sequence_conflict")
+        self.assertEqual(corrected[2].review_reason, "ocr_sequence_conflict")
+
     def test_vertical_ocr_characters_form_a_lyric_anchor(self):
         frames = [OcrFrame(11.0, ("待", "っ", "た"), (0.99, 0.98, 0.99))]
         lyrics = [LyricLine("待った！ナシだ", "等等！这可不算")]
@@ -227,6 +283,139 @@ class OcrAssistanceTests(unittest.TestCase):
 
         self.assertIs(apply_ocr_timing_assist(baseline, anchors), baseline)
 
+    def test_long_whisper_span_is_tightened_from_late_visual_anchor(self):
+        baseline = [
+            AlignmentItem(0.0, 20.0, "吞入间奏的第一行"),
+            AlignmentItem(20.0, 25.0, "第二行"),
+            AlignmentItem(25.0, 30.0, "第三行"),
+        ]
+        anchors = [
+            OcrLineAnchor(
+                0,
+                18.5,
+                0.0,
+                "第一行歌词",
+                "第一行歌词",
+                99.0,
+                0.5,
+                target_coverage=1.0,
+                visual_start=17.25,
+                visual_end=19.75,
+                sample_count=5,
+            ),
+            OcrLineAnchor(1, 22.5, 0.0, "第二行", "第二行", 99.0, 0.5),
+            OcrLineAnchor(2, 27.5, 0.0, "第三行", "第三行", 99.0, 0.5),
+        ]
+
+        corrected = apply_ocr_timing_assist(baseline, anchors)
+
+        self.assertAlmostEqual(corrected[0].start, 14.75)
+        self.assertAlmostEqual(corrected[0].end, 19.75)
+        self.assertEqual(corrected[0].review_reason, "ocr_duration_outlier")
+
+    def test_sustained_visual_span_uses_its_own_start_boundary(self):
+        baseline = [
+            AlignmentItem(0.0, 20.0, "吞入片头的第一行"),
+            AlignmentItem(20.0, 25.0, "第二行"),
+            AlignmentItem(25.0, 30.0, "第三行"),
+        ]
+        anchors = [
+            OcrLineAnchor(
+                0,
+                17.5,
+                0.0,
+                "第一行歌词",
+                "第一行歌词",
+                99.0,
+                0.65,
+                target_coverage=0.65,
+                visual_start=14.75,
+                visual_end=19.75,
+                sample_count=10,
+            ),
+            OcrLineAnchor(1, 22.5, 0.0, "第二行", "第二行", 99.0, 0.5),
+            OcrLineAnchor(2, 27.5, 0.0, "第三行", "第三行", 99.0, 0.5),
+        ]
+
+        corrected = apply_ocr_timing_assist(baseline, anchors)
+
+        self.assertAlmostEqual(corrected[0].start, 14.75)
+
+    def test_long_whisper_span_keeps_the_nearest_start_edge(self):
+        baseline = [
+            AlignmentItem(10.0, 20.0, "合并了下一行的字幕"),
+            AlignmentItem(20.0, 23.0, "第二行"),
+            AlignmentItem(23.0, 26.0, "第三行"),
+        ]
+        anchors = [
+            OcrLineAnchor(
+                0,
+                12.5,
+                0.0,
+                "第一行歌词",
+                "第一行歌词",
+                99.0,
+                0.5,
+                target_coverage=1.0,
+                visual_start=10.25,
+                visual_end=14.75,
+                sample_count=9,
+            ),
+            OcrLineAnchor(1, 21.5, 0.0, "第二行", "第二行", 99.0, 0.5),
+            OcrLineAnchor(2, 24.5, 0.0, "第三行", "第三行", 99.0, 0.5),
+        ]
+
+        corrected = apply_ocr_timing_assist(baseline, anchors)
+
+        self.assertAlmostEqual(corrected[0].start, 10.25)
+        self.assertAlmostEqual(corrected[0].end, 14.75)
+
+    def test_late_partial_fragment_extends_end_without_dragging_start(self):
+        baseline = [
+            AlignmentItem(0.0, 5.0, "第一行"),
+            AlignmentItem(5.0, 10.0, "倒数第二行"),
+            AlignmentItem(10.0, 10.9, "最后一行"),
+        ]
+        anchors = [
+            OcrLineAnchor(0, 2.5, 0.0, "第一行", "第一行", 99.0, 0.5),
+            OcrLineAnchor(1, 7.5, 0.0, "倒数第二行", "倒数第二行", 99.0, 0.5),
+            OcrLineAnchor(
+                2,
+                15.0,
+                1.0,
+                "最后一行歌词",
+                "歌词",
+                90.0,
+                0.8,
+                target_coverage=0.4,
+                visual_start=14.25,
+                visual_end=15.75,
+                sample_count=3,
+            ),
+        ]
+
+        corrected = apply_ocr_timing_assist(baseline, anchors)
+
+        self.assertAlmostEqual(corrected[2].start, 10.0)
+        self.assertAlmostEqual(corrected[2].end, 16.0)
+        self.assertEqual(corrected[2].review_reason, "ocr_partial_span")
+
+    def test_long_baseline_does_not_reject_true_late_ocr_frame(self):
+        lyrics = [
+            LyricLine("昨日も今日も晴天で", "第一行"),
+            LyricLine("二番目の歌詞", "第二行"),
+            LyricLine("三番目の歌詞", "第三行"),
+        ]
+        baseline = [
+            AlignmentItem(0.0, 20.0, "第一行"),
+            AlignmentItem(20.0, 25.0, "第二行"),
+            AlignmentItem(25.0, 30.0, "第三行"),
+        ]
+        frames = [OcrFrame(18.5, ("昨日も今日も晴天で",), (0.99,))]
+
+        anchors = build_ocr_line_anchors(frames, lyrics, baseline)
+
+        self.assertEqual([anchor.line_index for anchor in anchors], [0])
 
 class ArtifactTests(unittest.TestCase):
     def test_transcript_metadata_does_not_depend_on_lyrics_content(self):
@@ -306,6 +495,27 @@ class ArtifactTests(unittest.TestCase):
 
         self.assertEqual(summary["matched_coverage"], 0.5)
         self.assertEqual(payload["summary"]["needs_review"], [2])
+
+    def test_alignment_report_marks_ocr_timing_risk(self):
+        aligned = [AlignmentItem(
+            1.0,
+            2.0,
+            "第一行",
+            "一番目",
+            "一番目",
+            100.0,
+            "matched",
+            review_reason="ocr_duration_outlier",
+        )]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report = Path(temp_dir) / "sample.alignment.json"
+            summary = save_alignment_report(aligned, report, 55.0)
+
+        self.assertEqual(summary["needs_review"], [1])
+        self.assertEqual(
+            summary["review_reasons"],
+            {"1": "ocr_duration_outlier"},
+        )
 
     def test_cached_no_burn_flow_generates_reviewable_artifacts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
