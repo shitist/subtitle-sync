@@ -1,8 +1,5 @@
 # 日语歌曲字幕对轴工具
 
-[![版本](https://img.shields.io/github/v/release/shitist/subtitle-sync)](https://github.com/shitist/subtitle-sync/releases/latest)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-
 从日语歌曲视频提取音频，通过语音识别或歌词强制对齐确定时间轴，并把逐行中文字幕生成 SRT 或烧入视频。
 
 本工具用于把已有中文字幕对到音频时间轴，没有自动翻译功能，亦不是完整的字幕编辑器。
@@ -86,7 +83,7 @@ python subtitle_sync_gui.py
      → 按原词行号映射中文 → SRT + 对轴报告
 ```
 
-首次使用自动下载固定版本的 MMS、TIFA 和日语读音词典，后续从本机缓存加载。模型运行使用 FP32；依赖单独安装到 `.venv-align`。基础环境已有 PyTorch 和 Demucs 时：
+首次使用自动下载固定版本的 MMS、TIFA 和日语读音词典，后续从本机缓存加载。依赖单独安装到 `.venv-align`。基础环境已有 PyTorch 和 Demucs 时：
 
 ```powershell
 py -3.12 -m venv --system-site-packages .venv-align
@@ -96,7 +93,7 @@ python subtitle_sync_gui.py
 
 依赖清单包含 PyTorch 和 Demucs，已有兼容版本会直接复用。GUI 会检查依赖并优先选用 `.venv-align`。
 
-新模式只生成一个 `.alignment.json`，同时保存对齐结果、音素明细、缓存及待复核行，不生成 Whisper 或 OCR 的缓存。局部音素路径受整曲行归属约束，不能滑入其他歌词已占用的声音区间；超出整曲声学支持区间的扩展也不会直接采用。局部精对齐失败或两阶段不一致时保留声学定位并标为 `coarse_only`，不按字数摊分时间。声学分数不代表字幕时间的准确率。
+新模式只生成一个 `.alignment.json`，同时保存对齐结果、音素明细、缓存及待复核行。
 
 命令行入口：
 
@@ -127,15 +124,15 @@ python subtitle_sync_gui.py
      → SRT + 对轴报告 → 可选 FFmpeg 硬字幕烧入
 ```
 
-有日文原文时，程序会在 Whisper 独立识别完成后比较日文歌词与识别文字，不会把整段歌词作为识别提示。没有日文原文时，程序优先使用中文字幕中的英文/数字短语建立局部锚点；可用锚点不足时才使用低置信度时间比例回退。
+有日文原文时，程序会在 Whisper 独立识别完成后比较日文歌词与识别文字。没有日文原文时，程序优先使用中文字幕中的英文/数字短语建立局部锚点；可用锚点不足时才使用低置信度时间比例回退。
 
 ## 运行环境
 
 - Python 3.10+
 - FFmpeg（推荐加入系统 `PATH`）
-- 使用画面歌词辅助时需要 RapidOCR 与 ONNX Runtime（已列入 `requirements.txt`）
+- 使用画面歌词辅助时需要 RapidOCR 与 ONNX Runtime
 - 首次使用所选模型时需要联网自动下载
-- 模型越大，对内存或显存的要求越高
+- 8GB以上的运行内存（使用large v3时）
 
 Release 用户和源码用户都需要安装识别依赖：
 
@@ -143,7 +140,7 @@ Release 用户和源码用户都需要安装识别依赖：
 pip install -r requirements.txt
 ```
 
-有 NVIDIA 显卡时需要安装与本机 CUDA 环境匹配的 PyTorch/CTranslate2 运行库。没有可用 GPU 时，Whisper 使用 CPU `int8`。歌词声学对齐使用 FP32。
+有 NVIDIA 显卡时需要安装与本机 CUDA 环境匹配的 PyTorch/CTranslate2 运行库。没有可用 GPU 时，Whisper 使用 CPU `int8`，歌词声学对齐使用 FP32。速度虽然会慢一些，但也属于能接受的范畴。
 
 ## 歌词格式
 
@@ -169,16 +166,16 @@ pip install -r requirements.txt
 生まれた光
 ```
 
-**连续两个及以上空行会被当作明确的块分隔符**；单个空行只用于歌词段落排版并会被忽略。没有双空行时，程序继续通过日文假名位置兼容旧歌词文件。两段行数相同时会按行配对。行数不一致时，程序会给出警告，缺少日文原文的行将通过相邻文本锚点补齐并列入待检查项。
+**连续两个及以上空行会被当作明确的块分隔符**；单个空行只用于歌词段落排版并会被忽略。没有双空行时，程序继续通过日文假名位置兼容旧歌词文件。两段行数相同时会按行配对。行数不一致时，程序会给出警告。
 
-### 纯中文（低置信度回退）
+### 纯中文（不推荐）
 
 ```text
 在世界终结之处
 诞生的光芒
 ```
 
-纯中文无法与日语识别文本直接比较。歌词中存在足够英文/数字短语时会使用这些内容作为低置信度顺序锚点，其余行仅在相邻锚点间补齐；否则只能利用声音片段边界估算时间。
+精度很差。歌词中存在足够英文/数字短语时会使用这些内容作为低置信度顺序锚点，其余行仅在相邻锚点间补齐；否则只能利用声音片段边界估算时间。如非实在没办法尽量不要使用。
 
 ## 界面与命令行
 
@@ -196,11 +193,9 @@ pip install -r requirements.txt
 - 启用或禁用 VAD
 - 固定显示当前阶段、进度条和已运行时间
 
-界面只显示阶段、匹配摘要和输出路径。Whisper 的逐段识别文字仍会保存在完整日志中，不再占满窗口。
-
 GUI 启动处理前会扫描项目虚拟环境、`PATH` 和 Windows Python Launcher 注册的解释器，并逐一检查 Python 版本及 `faster_whisper`、`rapidfuzz`、`demucs` 等模块。选择 Demucs 人声时，缺少 `demucs` 的解释器不会被采用；开启画面歌词辅助时还会检查 `rapidocr` 与 `onnxruntime`。没有合格环境时会在提取音频前停止并列出缺失模块。
 
-可使用环境变量 `SUBTITLE_SYNC_PYTHON` 指定专用解释器。指定环境仍须通过版本和依赖检查。
+可使用环境变量 `SUBTITLE_SYNC_PYTHON` 指定专用解释器。
 
 ### 自动运行诊断
 
