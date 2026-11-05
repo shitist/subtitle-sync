@@ -1,6 +1,6 @@
 # 日语歌曲字幕对轴工具
 
-从日语歌曲视频提取音频，识别日文歌声，并把逐行中文字幕生成 SRT 或烧入视频。
+从日语歌曲视频提取音频，通过语音识别或歌词强制对齐确定时间轴，并把逐行中文字幕生成 SRT 或烧入视频。
 
 本工具用于把已有中文字幕对到音频时间轴，没有自动翻译功能，亦不是完整的字幕编辑器。
 
@@ -36,27 +36,26 @@ python subtitle_sync_gui.py
 - 访谈、解说、Vlog、动画对白等非音乐视频。语音清楚时通常比歌曲更容易识别。
 - 已经有逐行中文字幕，只需要生成 SRT 时间轴或烧入视频。
 - 画面本身带有日文歌词或硬字幕的视频，可选用 OCR 画面歌词辅助校准。
-- 先自动生成初稿，再结合 `alignment.json` 和播放器进行人工复核。
 
 局限：
 
-- **自动对轴结果仅供人工复核，不能直接交付；即使使用 `Large v3`，目前算法下个别字幕仍可能有 0–5 秒误差。**
-- 不会把日语自动翻译成中文，必须提供准备好的中文字幕或歌词。
-- 识别语言固定为日语。Whisper 本身支持其他语言，但其他语言的歌词解析与匹配效果尚未经过实测。
+- **自动对轴结果仅供人工复核，即使使用 `Large v3`，目前算法下个别字幕仍可能有 0–5 秒误差。**
+- 必须提供准备好的中文字幕或歌词。
+- 日语外的语言的歌词解析与匹配效果尚未经过实测。
 - 歌唱、和声、多人重叠、现场噪声、混响和重伴奏都会降低识别与文本锚点覆盖率。
-- 没有匹配到的歌词行会在相邻锚点之间补时间，不能保证达到逐帧精度；锚点覆盖率低时必须复核。
+- 没有匹配到的歌词行会在相邻锚点之间补时间，无法达到逐帧精度。
 - OCR 只能利用视频里确实存在的可读文字；无画面歌词、纯装饰文字、严重旋转或故意提前/延后的歌词可能无效或产生误差。
-- 不处理说话人区分、字幕断句改写、翻译、特效字幕或复杂排版。
 
 非音乐视频通常直接选择“原始音频”即可；“分离人声”主要用于伴奏较重的歌曲，MV等场景推荐分离人声。
 
 ## 语音模型
 
-界面只提供四个预设，不需要填写模型名称或识别参数：
+界面提供模型与打轴方式预设，不需要填写模型名称或识别参数：
 
 | 选项 | 适合内容 | 取舍 |
 |---|---|---|
-| `Large v3`（默认） | 日语歌曲、现场、背景声复杂或音质一般的视频 | 精度优先，速度最慢，资源占用最高 |
+| `Large v3`（默认） | 日语歌曲、现场、背景声复杂或音质一般的视频 | 精度优先，处理较慢 |
+| `歌词声学对齐`（实验性） | 已有逐行对应的中日歌词的 MV | 歌词强制对齐路线：MMS 整曲声学定位 + TIFA 局部音素精对齐；FP32 |
 | `Large v3 Turbo` | 访谈、解说、Vlog 和一般视频 | 接近 Large v3，处理明显更快 |
 | `Medium` | 较清晰的语音、硬件资源有限的电脑 | 速度与精度折中 |
 | `Small` | 清晰单人语音、快速草稿、CPU 环境 | 最轻量，不建议用于歌曲和嘈杂音频 |
@@ -66,6 +65,45 @@ python subtitle_sync_gui.py
 模型能力和相对速度可参考 [OpenAI Whisper 模型表](https://github.com/openai/whisper#available-models-and-languages)，自动下载行为见 [faster-whisper 使用说明](https://github.com/SYSTRAN/faster-whisper#model-conversion)。
 
 ## 对轴方式
+
+### 歌词强制对齐（Forced Alignment，实验性）
+
+新增实验性的歌词强制对齐（Forced Alignment）路线，在“打轴方式”中选择“歌词声学对齐”即可使用。日文原词直接参与音频对齐，再按原词行号把时间映射到中文。
+
+在目前测试的日语 MV 打轴场景中，相比本工具原有的 Whisper Large v3 ASR 路线，该方案对轴更精确，模型也更轻量。在测试中字幕起点与终点相对人工标准轴的平均绝对误差约为0.2秒，已达到可用级别。
+
+但该模式目前仅依据音频确定时间轴，无法自动校正 MV 画面字幕与实际演唱之间的错位，暂不支持 OCR 辅助和 VAD。如果要让字幕适配MV字幕，仍需要手动调整。
+
+歌词格式沿用“中文整块＋双空行＋日文整块”，两块非空行数必须一致。中文只用于最后的字幕输出；修改中文翻译可复用声学对齐缓存。纯中文输入和中日行数不一致时会停止并提示检查。
+
+```text
+视频 → 提取音频 → 分离人声（可选）
+     → 日文读音转换 → MMS 帧概率 + 整曲顺序路径搜索
+     → 不超过 24 秒的带上下文窗口 → TIFA 音素边界
+     → 按原词行号映射中文 → SRT + 对轴报告
+```
+
+首次使用自动下载固定版本的 MMS、TIFA 和日语读音词典，后续从本机缓存加载。模型运行使用 FP32；依赖单独安装到 `.venv-align`。基础环境已有 PyTorch 和 Demucs 时：
+
+```powershell
+py -3.12 -m venv --system-site-packages .venv-align
+.\.venv-align\Scripts\python.exe -X utf8 -m pip install -r requirements-align.txt
+python subtitle_sync_gui.py
+```
+
+依赖清单包含 PyTorch 和 Demucs，已有兼容版本会直接复用。GUI 会检查依赖并优先选用 `.venv-align`。
+
+新模式只生成一个 `.alignment.json`，同时保存对齐结果、音素明细、缓存及待复核行，不生成 Whisper 或 OCR 的缓存。局部音素路径受整曲行归属约束，不能滑入其他歌词已占用的声音区间；超出整曲声学支持区间的扩展也不会直接采用。局部精对齐失败或两阶段不一致时保留声学定位并标为 `coarse_only`，不按字数摊分时间。声学分数不代表字幕时间的准确率。
+
+命令行入口：
+
+```powershell
+.\.venv-align\Scripts\python.exe subtitle_sync.py --video song.mp4 --lyrics song.txt --model lyrics-mms-tifa --no-burn
+```
+
+本模式仍处于实验阶段，部分句子的起止时间仍可能有偏差，生成后需要人工复核。模型权重为非商业许可，见 [第三方许可](THIRD_PARTY_NOTICES.md)。
+
+### Whisper 文本匹配
 
 推荐使用逐行双语歌词：
 
@@ -79,7 +117,7 @@ python subtitle_sync_gui.py
 
 ```text
 视频 → FFmpeg 提取音频 → Demucs 人声分离（可选）
-     → faster-whisper 所选模型逐词识别
+     → Whisper 逐词识别
      → 日文歌词与识别文本进行顺序受限匹配
      → 高分匹配作为时间锚点，漏识别行在相邻锚点间局部补齐
      → 可选 OCR 扫描画面歌词，校正局部漂移和明显错位边界
@@ -102,7 +140,7 @@ Release 用户和源码用户都需要安装识别依赖：
 pip install -r requirements.txt
 ```
 
-有 NVIDIA 显卡时需要安装与本机 CUDA 环境匹配的 PyTorch/CTranslate2 运行库。没有可用 GPU 时会使用 CPU `int8`。
+有 NVIDIA 显卡时需要安装与本机 CUDA 环境匹配的 PyTorch/CTranslate2 运行库。没有可用 GPU 时，Whisper 使用 CPU `int8`。歌词声学对齐使用 FP32。
 
 ## 歌词格式
 
@@ -147,7 +185,7 @@ pip install -r requirements.txt
 
 - 单文件和批量处理
 - 视频和歌词拖拽功能
-- 四档语音模型预设及适用场景说明
+- 语音模型与歌词声学对齐预设及适用场景说明
 - Demucs 人声或原始混合音频
 - 仅生成 SRT
 - 强制重新运行 Whisper
@@ -261,15 +299,19 @@ python subtitle_sync.py --batch --video-dir ./videos --lyrics-dir ./lyrics
 Subtitle-tool/
 ├─ subtitle_sync.py          核心处理与命令行入口
 ├─ subtitle_sync_gui.py      PySide6 图形界面
+├─ asr_models.py             语音模型与权重版本
+├─ lyric_alignment/          歌词声学对齐核心、模型资源与输出流程
 ├─ requirements.txt          识别和视频处理依赖
 ├─ requirements-gui.txt      源码运行与打包 GUI 的依赖
+├─ requirements-align.txt    可选歌词声学对齐运行依赖
 ├─ build.spec                PyInstaller 打包配置
 ├─ tests/                    对轴、缓存和 GUI 测试
-├─ release/                  本地 Release 准备目录
-│  ├─ SubtitleSync.exe       可单独发布的 Windows 图形界面程序
-│  ├─ subtitle_sync.py       可选的外置核心脚本
-│  └─ requirements.txt       识别环境依赖清单
+├─ tools/benchmark_asr.py     独立转录文字与时间误差评测
+├─ tools/benchmark_lyrics.py  歌词声学对齐多曲回归与逐句误差评测
+├─ dist/                     打包输出（不提交到 Git）
+│  └─ SubtitleSync.exe       可单独发布的 Windows 图形界面程序
 ├─ LICENSE                   MIT License
+├─ THIRD_PARTY_NOTICES.md     第三方模型与许可
 └─ README.md                 使用说明
 ```
 ## 打包说明
@@ -279,7 +321,7 @@ pip install -r requirements-gui.txt
 pyinstaller build.spec
 ```
 
-打包后的 `SubtitleSync.exe` 内置 PySide6 界面，但不内置 Whisper、Demucs、RapidOCR 运行库和模型。目标机器仍需安装可用的 Python 3.10+ 及 `requirements.txt` 中的依赖。EXE 会优先使用同目录的 `subtitle_sync.py`，方便更新核心算法。
+打包后的 `SubtitleSync.exe` 内置 PySide6 界面及处理脚本，但不内置语音识别、Demucs、RapidOCR 运行库和模型。目标机器仍需安装可用的 Python 3.10+ 及运行依赖；歌词声学对齐使用 `requirements-align.txt`。EXE 会优先使用同目录的 `subtitle_sync.py`；更新外置脚本时应一并更新 `asr_models.py` 和 `lyric_alignment/`。
 
 ## 测试
 
@@ -291,4 +333,4 @@ python -m unittest discover -s tests -v
 
 ## 许可证
 
-本项目采用 [MIT License](LICENSE)。发布源码、Release 和派生版本时应保留许可证与版权声明。
+本项目自身代码采用 [MIT License](LICENSE)。发布源码、Release 和派生版本时应保留许可证与版权声明。第三方模型与资源分别遵守其上游许可；MMS 日语卡拉 OK 对齐与 TIFA 预训练权重使用 CC BY-NC-SA 4.0，不属于本项目 MIT 授权范围，详见 [第三方许可](THIRD_PARTY_NOTICES.md)。

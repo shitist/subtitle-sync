@@ -7,7 +7,7 @@ subtitle_sync.py
 工作流程:
   1. FFmpeg 提取音频
   2. Demucs 人声分离（去掉背景音乐，提升 Whisper 准确率）
-  3. faster-whisper 可选模型独立识别日语并输出 word 级时间戳
+  3. Whisper 识别日语，或用中日双语歌词进行声学对齐
   4. 智能对轴：
      - 若有日文歌词：fuzzy matching（rapidfuzz）日→日匹配，再映射到中文
      - 若仅中文歌词：优先使用英文锚点局部对齐，否则低置信度时间回退
@@ -45,6 +45,7 @@ from dataclasses import asdict, dataclass, replace
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Optional
+from asr_models import LYRIC_MODEL, SUPPORTED_MODELS, model_label
 # 强制禁止创建软链接，绕过 Windows 恶心的权限限制
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 
@@ -61,6 +62,14 @@ DEFAULT_MIN_MATCH_SCORE = 55.0
 DEFAULT_OCR_MATCH_SCORE = 82.0
 DEFAULT_OCR_SAMPLE_INTERVAL = 0.5
 DEFAULT_WHISPER_MODEL = "large-v3"
+DEMUCS_PROFILE = "htdemucs-shift1-seed0-v1"
+# Demucs' test-time shifts use Python's random generator. Seed inside the
+# child process (seeding the GUI/parent would not affect a fresh interpreter).
+DEMUCS_LAUNCHER = (
+    "import random, runpy; import numpy as np; import torch; "
+    "random.seed(0); np.random.seed(0); torch.manual_seed(0); "
+    "runpy.run_module('demucs', run_name='__main__')"
+)
 SUPPORTED_WHISPER_MODELS = (
     "large-v3",
     "large-v3-turbo",
@@ -165,7 +174,7 @@ def extract_audio(video_path: Path, output_wav: Path) -> None:
 # 步骤 2: 人声分离
 # ──────────────────────────────────────────────────────────────────────────────
 
-def separate_vocals(audio_path: Path, work_dir: Path) -> Path:
+def separate_vocals(audio_path: Path, work_dir: Path, *, deterministic: bool = False) -> Path:
     """
     用 Demucs htdemucs 模型分离人声。
     返回人声 WAV 文件路径。
@@ -176,8 +185,12 @@ def separate_vocals(audio_path: Path, work_dir: Path) -> Path:
     if ffmpeg_dir not in os.environ.get("PATH", ""):
         os.environ["PATH"] = f"{ffmpeg_dir}{os.pathsep}{os.environ.get('PATH', '')}"
 
+    # Fixed shifts are opt-in for controlled experiments. The application keeps
+    # its existing default until the changed audio passes the timing regressions.
+    entrypoint = (["-c", DEMUCS_LAUNCHER, "-n", "htdemucs", "--shifts", "1"]
+                  if deterministic else ["-m", "demucs"])
     cmd = [
-        sys.executable, "-m", "demucs",
+        sys.executable, *entrypoint,
         "--two-stems=vocals",
         "--out", str(work_dir),
         str(audio_path),
@@ -210,16 +223,18 @@ def transcribe_audio(
     use_vad: bool = True,
 ) -> list:
     """
-    用选定的 faster-whisper 模型识别日语，返回片段列表。
+    用选定的语音模型识别日语，返回统一的词级时间片段。
 
     参数:
       audio_path:     人声 WAV 文件路径
-      model_name:     faster-whisper 模型名称
+      model_name:     语音模型标识
       use_vad:        是否启用 VAD 静音过滤
 
     返回:
       片段列表，每个元素有 .start, .end, .text, .words（词级时间戳）
     """
+    if model_name not in SUPPORTED_WHISPER_MODELS:
+        raise ValueError(f"不支持的 Whisper 模型: {model_name}")
     try:
         from faster_whisper import WhisperModel
     except ImportError:
@@ -292,7 +307,7 @@ def _detect_device():
 #   时间比例分配。识别数量变化不会再直接造成整首歌词全局错位。
 # ──────────────────────────────────────────────────────────────────────────────
 
-def load_lyrics(lyrics_path: Path) -> tuple[str, list[LyricLine]]:
+def load_lyrics(lyrics_path: Path, require_pairs: bool = False) -> tuple[str, list[LyricLine]]:
     """
     从 UTF-8 文本文件读取歌词，自动识别三种格式。
 
@@ -329,6 +344,8 @@ def load_lyrics(lyrics_path: Path) -> tuple[str, list[LyricLine]]:
     has_separator = any("|" in ln or "\t" in ln for ln in raw_lines)
     if has_separator:
         ja_list, zh_list = _parse_line_bilingual(raw_lines)
+        if require_pairs and not all(ja.strip() and zh.strip() for ja, zh in zip(ja_list, zh_list)):
+            raise ValueError("歌词声学对齐需要每行日文原词及其对应中文，请检查缺失的行")
         ja_prompt = "。".join(j for j in ja_list if j)
         print(f"    检测到逐行双语歌词：中文 {len(zh_list)} 行")
         return ja_prompt, [LyricLine(ja, zh) for ja, zh in zip(ja_list, zh_list)]
@@ -344,6 +361,8 @@ def load_lyrics(lyrics_path: Path) -> tuple[str, list[LyricLine]]:
             f"中文 {len(zh_lines)} 行 + 日文 {len(ja_lines)} 行"
         )
         if len(zh_lines) != len(ja_lines):
+            if require_pairs:
+                raise ValueError(f"中/日歌词行数不一致：中文 {len(zh_lines)} 行，日文 {len(ja_lines)} 行")
             print(f"    ⚠️  中/日行数不一致，请检查双空行分隔位置。")
         lyric_lines = [
             LyricLine(ja_lines[i] if i < len(ja_lines) else "", zh)
@@ -356,6 +375,8 @@ def load_lyrics(lyrics_path: Path) -> tuple[str, list[LyricLine]]:
     kana_count = sum(kana_flags)
 
     if kana_count == 0:
+        if require_pairs:
+            raise ValueError("歌词声学对齐需要中日双语歌词：先中文整块，空两行，再日文整块")
         # 纯中文
         print(f"    检测到纯中文歌词，共 {len(raw_lines)} 行")
         return "", [LyricLine("", line) for line in raw_lines]
@@ -382,6 +403,8 @@ def load_lyrics(lyrics_path: Path) -> tuple[str, list[LyricLine]]:
     print(f"    检测到中/日分块歌词：中文 {len(zh_lines)} 行 + 日文 {len(ja_lines)} 行")
 
     if len(zh_lines) != len(ja_lines):
+        if require_pairs:
+            raise ValueError(f"中/日歌词行数不一致：中文 {len(zh_lines)} 行，日文 {len(ja_lines)} 行；请用双空行分隔")
         print(f"    💡 中/日行数不一致，日文仅用于辅助 Whisper 识别，"
               f"最终字幕 = {len(zh_lines)} 行中文")
 
@@ -450,6 +473,7 @@ def align_lyrics_to_segments(
     segments: list,
     lyric_lines: list[LyricLine],
     min_match_score: float = DEFAULT_MIN_MATCH_SCORE,
+    strict_anchors: bool = False,
 ) -> list[AlignmentItem]:
     """
     使用日文歌词与 Whisper 识别文本进行单调动态规划匹配。
@@ -470,10 +494,12 @@ def align_lyrics_to_segments(
 
     if words and japanese_count:
         print(f"    对轴模式: 日文文本动态规划匹配（可匹配 {japanese_count}/{len(lyric_lines)} 行）")
-        return _align_with_text(words, lyric_lines, min_match_score)
+        return _align_with_text(words, lyric_lines, min_match_score, strict_anchors=strict_anchors)
 
     if words:
-        latin_aligned = _align_with_latin_anchors(words, lyric_lines, min_match_score)
+        latin_aligned = _align_with_latin_anchors(
+            words, lyric_lines, min_match_score, strict_anchors=strict_anchors,
+        )
         if latin_aligned is not None:
             return latin_aligned
 
@@ -1216,6 +1242,7 @@ def _align_with_latin_anchors(
     words: list[WordTiming],
     lyric_lines: list[LyricLine],
     min_match_score: float,
+    strict_anchors: bool = False,
 ) -> Optional[list[AlignmentItem]]:
     """纯中文歌词使用其中的英文/数字短语作为低置信度顺序锚点。"""
     anchor_lines = [
@@ -1246,6 +1273,7 @@ def _align_with_latin_anchors(
         anchor_lines,
         anchor_threshold,
         max_span_seconds=5.0,
+        strict_anchors=strict_anchors,
     )
     matched_count = 0
     for item in aligned:
@@ -1264,6 +1292,7 @@ def _align_with_text(
     lyric_lines: list[LyricLine],
     min_match_score: float,
     max_span_seconds: Optional[float] = None,
+    strict_anchors: bool = False,
 ) -> list[AlignmentItem]:
     """按歌词顺序将每行日文匹配到连续的 Whisper word span。"""
     line_count = len(lyric_lines)
@@ -1271,7 +1300,8 @@ def _align_with_text(
     infinity = float("inf")
     skip_word_cost = 0.16
     missing_line_cost = 1.05
-    candidate_floor = max(30.0, min_match_score - 20.0)
+    anchor_threshold = max(75.0, min_match_score) if strict_anchors else min_match_score
+    candidate_floor = anchor_threshold if strict_anchors else max(30.0, min_match_score - 20.0)
 
     costs = [[infinity] * (word_count + 1) for _ in range(line_count + 1)]
     previous: list[list[Optional[tuple]]] = [
@@ -1327,6 +1357,22 @@ def _align_with_text(
                 normalized_recognized = _normalize_japanese(recognized)
                 if not normalized_recognized:
                     continue
+                if (
+                    strict_anchors and len(target) <= 16
+                    and re.fullmatch(r"[a-z0-9]+", target)
+                    and target != normalized_recognized
+                ):
+                    target_tokens = re.findall(r"[a-z0-9]+", unicodedata.normalize("NFKC", line.ja).casefold())
+                    observed_tokens = re.findall(r"[a-z0-9]+", " ".join(raw_parts).casefold())
+                    exact_words = sum(block.size for block in SequenceMatcher(
+                        None, target_tokens, observed_tokens, autojunk=False,
+                    ).get_matching_blocks())
+                    if exact_words / max(len(target_tokens), 1) < 0.75:
+                        continue
+                if strict_anchors:
+                    timed_words = [word for word in words[word_index:end_index] if word.end > word.start]
+                    if not timed_words or len(timed_words) * 2 < span_size:
+                        continue
                 if len(normalized_recognized) > len(target) * 3 + 10:
                     break
 
@@ -1362,8 +1408,13 @@ def _align_with_text(
 
     anchored: dict[int, AlignmentItem] = {}
     for index, (start_word, end_word, score, recognized) in matches.items():
-        if score < min_match_score:
+        if score < anchor_threshold:
             continue
+        span_words = words[start_word:end_word]
+        if strict_anchors:
+            span_words = [word for word in span_words if word.end > word.start]
+            if not span_words:
+                continue
         probabilities = [
             word.probability
             for word in words[start_word:end_word]
@@ -1378,8 +1429,8 @@ def _align_with_text(
             else "low_confidence"
         )
         anchored[index] = AlignmentItem(
-            start=words[start_word].start,
-            end=words[end_word - 1].end,
+            start=span_words[0].start,
+            end=span_words[-1].end,
             text=lyric_lines[index].zh,
             source_text=lyric_lines[index].ja,
             recognized_text=recognized,
@@ -1390,7 +1441,7 @@ def _align_with_text(
             ),
         )
 
-    print(f"    文本锚点: {len(anchored)}/{line_count} 行（阈值 {min_match_score:.0f}）")
+    print(f"    文本锚点: {len(anchored)}/{line_count} 行（阈值 {anchor_threshold:.0f}）")
     return _fill_unmatched_lines(lyric_lines, anchored, words[0].start, words[-1].end)
 
 
@@ -1449,6 +1500,7 @@ def _fill_unmatched_lines(
                 text=lyric_lines[index].zh,
                 source_text=lyric_lines[index].ja,
                 status="interpolated",
+                review_reason=("连续多行未可靠定位，时间为估计值" if count >= 3 else ""),
             )
             position = end
             weight_sum -= weight
@@ -1589,14 +1641,10 @@ def _get_word_end(segment) -> float:
 
 def _fmt_srt_time(seconds: float) -> str:
     """将秒数格式化为 SRT 时间戳 HH:MM:SS,mmm。"""
-    h   = int(seconds // 3600)
-    m   = int((seconds % 3600) // 60)
-    s   = int(seconds % 60)
-    ms  = int(round((seconds % 1) * 1000))
-    # 毫秒溢出修正
-    if ms >= 1000:
-        ms -= 1000
-        s  += 1
+    total_ms = max(0, round(seconds * 1000))
+    total_seconds, ms = divmod(total_ms, 1000)
+    h, remainder = divmod(total_seconds, 3600)
+    m, s = divmod(remainder, 60)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
@@ -1614,6 +1662,7 @@ def save_alignment_report(
     aligned: list[AlignmentItem],
     output_path: Path,
     min_match_score: float,
+    strict_anchors: bool = False,
 ) -> dict:
     """保存逐行匹配依据与置信度，返回摘要。"""
     matched = [
@@ -1640,11 +1689,14 @@ def save_alignment_report(
         if mode == "latin_anchor"
         else min_match_score
     )
+    if strict_anchors:
+        effective_minimum = max(75.0, effective_minimum)
     summary = {
         "mode": mode,
         "line_count": len(aligned),
         "matched_lines": len(matched),
         "matched_coverage": round(len(matched) / len(aligned), 4) if aligned else 0.0,
+        "estimated_lines": sum(item.status == "interpolated" for item in aligned),
         "average_match_score": round(sum(scores) / len(scores), 2) if scores else None,
         "average_word_probability": (
             round(sum(word_probabilities) / len(word_probabilities), 4)
@@ -1803,8 +1855,8 @@ def _transcript_metadata(
     audio_source: str,
     model_name: str = DEFAULT_WHISPER_MODEL,
 ) -> dict:
-    # 识别不再依赖歌词内容；同一音视频设置可在纯中文/双语歌词间复用缓存。
-    return {
+    # Whisper 原始转录不依赖歌词内容。
+    metadata = {
         "schema_version": TRANSCRIPT_CACHE_SCHEMA,
         "model": model_name,
         "language": "ja",
@@ -1813,13 +1865,11 @@ def _transcript_metadata(
         "audio_source": audio_source,
         "video": _file_fingerprint(video_path),
     }
+    return metadata
 
 
-def save_transcript_cache(path: Path, segments: list, metadata: dict) -> None:
-    payload = {
-        "metadata": metadata,
-        "segments": [],
-    }
+def _transcript_records(segments: list) -> list[dict]:
+    records = []
     for segment in segments:
         words = []
         for word in getattr(segment, "words", None) or []:
@@ -1830,15 +1880,28 @@ def save_transcript_cache(path: Path, segments: list, metadata: dict) -> None:
                 "text": getattr(word, "word", getattr(word, "text", "")),
                 "probability": float(probability) if probability is not None else None,
             })
-        payload["segments"].append({
+        record = {
             "start": float(segment.start),
             "end": float(segment.end),
             "text": getattr(segment, "text", ""),
             "words": words,
-        })
+        }
+        records.append(record)
+    return records
+
+
+def _transcript_segments(records: list[dict]) -> list[SimpleSegment]:
+    return [SimpleSegment(
+        start=float(raw["start"]), end=float(raw["end"]), text=raw.get("text", ""),
+        words=[WordTiming(**word) for word in raw.get("words", [])],
+    ) for raw in records]
+
+
+def save_transcript_cache(path: Path, segments: list, metadata: dict) -> None:
+    payload = {"metadata": metadata, "segments": _transcript_records(segments)}
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
-    print(f"    Whisper 转录缓存已保存: {path}")
+    print(f"    转录缓存已保存: {path}")
 
 
 def load_transcript_cache(path: Path, expected_metadata: dict) -> Optional[list[SimpleSegment]]:
@@ -1848,27 +1911,16 @@ def load_transcript_cache(path: Path, expected_metadata: dict) -> Optional[list[
         with open(path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
         if payload.get("metadata") != expected_metadata:
-            print("    已有 Whisper 缓存与当前输入或设置不一致，将重新识别。")
+            print("    已有转录缓存与当前输入或设置不一致，将重新识别。")
             return None
-        segments = []
-        for raw_segment in payload.get("segments", []):
-            segments.append(SimpleSegment(
-                start=float(raw_segment["start"]),
-                end=float(raw_segment["end"]),
-                text=raw_segment.get("text", ""),
-                words=[WordTiming(**word) for word in raw_segment.get("words", [])],
-            ))
+        segments = _transcript_segments(payload.get("segments", []))
         if segments:
-            print(f"    ♻️  复用 Whisper 转录缓存，共 {len(segments)} 个片段")
+            print(f"    ♻️  复用转录缓存，共 {len(segments)} 个片段")
             return segments
     except (OSError, ValueError, KeyError, TypeError) as error:
-        print(f"    ⚠️  Whisper 缓存读取失败，将重新识别: {error}")
+        print(f"    ⚠️  转录缓存读取失败，将重新识别: {error}")
     return None
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 主流程
-# ──────────────────────────────────────────────────────────────────────────────
 
 def process_single(
     video_path: Path,
@@ -1895,8 +1947,17 @@ def process_single(
 
     if audio_source not in {"vocals", "original"}:
         raise ValueError(f"不支持的音源模式: {audio_source}")
-    if model_name not in SUPPORTED_WHISPER_MODELS:
-        raise ValueError(f"不支持的 Whisper 模型: {model_name}")
+    if model_name not in SUPPORTED_MODELS:
+        raise ValueError(f"不支持的语音模型: {model_name}")
+
+    if model_name == LYRIC_MODEL:
+        if ocr_assist:
+            raise ValueError("歌词声学对齐模式不使用画面歌词辅助，请关闭该选项")
+        from lyric_alignment.workflow import process_known_lyrics
+        return process_known_lyrics(
+            video_path, lyrics_path, output_path, audio_source=audio_source,
+            no_burn=no_burn, refresh=refresh_transcript, helpers=sys.modules[__name__],
+        )
 
     _banner(f"处理: {video_path.name}")
     total_steps = 8 if ocr_assist else 7
@@ -1906,7 +1967,6 @@ def process_single(
 
         _step(1, total_steps, "加载歌词")
         _ja_prompt, lyric_lines = load_lyrics(lyrics_path)
-
         cache_path = output_path.with_suffix(".whisper.json")
         metadata = _transcript_metadata(
             video_path,
@@ -1915,7 +1975,6 @@ def process_single(
             model_name=model_name,
         )
         segments = None if refresh_transcript else load_transcript_cache(cache_path, metadata)
-
         if segments is None:
             _step(2, total_steps, "提取音频")
             audio_wav = tmpdir / "audio.wav"
@@ -1928,7 +1987,7 @@ def process_single(
                 _step(3, total_steps, "使用原始混合音频（跳过 Demucs）")
                 transcription_audio = audio_wav
 
-            _step(4, total_steps, f"Whisper {model_name} 日语识别")
+            _step(4, total_steps, f"{model_label(model_name)} 日语识别")
             segments = transcribe_audio(
                 transcription_audio,
                 model_name=model_name,
@@ -1936,9 +1995,9 @@ def process_single(
             )
             save_transcript_cache(cache_path, segments, metadata)
         else:
-            _step(2, total_steps, "复用 Whisper 缓存，跳过音频提取")
-            _step(3, total_steps, "复用 Whisper 缓存，跳过人声分离")
-            _step(4, total_steps, "复用 Whisper 缓存，跳过识别")
+            _step(2, total_steps, "复用转录缓存，跳过音频提取")
+            _step(3, total_steps, "复用转录缓存，跳过人声分离")
+            _step(4, total_steps, "复用转录缓存，跳过识别")
 
         _step(5, total_steps, "文本驱动时间轴映射")
         aligned = align_lyrics_to_segments(
@@ -1987,6 +2046,9 @@ def process_single(
             and not summary["ocr_assisted"]
         ):
             print("    ⚠️  文本锚点覆盖率低于 50%，建议先检查 alignment.json 和 SRT。")
+        estimated = sum(item.status == "interpolated" for item in aligned)
+        if estimated:
+            print(f"    注意：{estimated} 行使用估计时间，需人工复核")
 
         if no_burn:
             _step(total_steps, total_steps, "仅生成 SRT，跳过视频烧录")
@@ -2189,19 +2251,19 @@ def main() -> None:
     parser.add_argument(
         "--refresh-transcript",
         action="store_true",
-        help="忽略已有 Whisper 缓存并重新识别",
+        help="忽略已有转录缓存并重新识别",
     )
     parser.add_argument(
         "--audio-source",
         choices=["vocals", "original"],
         default="vocals",
-        help="Whisper 音源：Demucs 人声或原始混合音频（默认: vocals）",
+        help="识别音源：Demucs 人声或原始混合音频（默认: vocals）",
     )
     parser.add_argument(
         "--model",
-        choices=SUPPORTED_WHISPER_MODELS,
+        choices=SUPPORTED_MODELS,
         default=DEFAULT_WHISPER_MODEL,
-        help=f"Whisper 模型（默认: {DEFAULT_WHISPER_MODEL}）",
+        help=f"语音模型（默认: {DEFAULT_WHISPER_MODEL}）",
     )
     parser.add_argument(
         "--min-match-score",

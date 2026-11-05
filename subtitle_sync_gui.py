@@ -13,6 +13,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from asr_models import LYRIC_MODEL
 
 from PySide6.QtCore import QObject, QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont, QPalette
@@ -76,6 +77,11 @@ PYTHON_MODULES = (
     "onnxruntime",
     "imageio_ffmpeg",
     "torch",
+    "transformers",
+    "librosa",
+    "safetensors",
+    "g2pflow", "fugashi", "unidic", "numba", "scipy", "soundfile",
+    "omegaconf", "pydantic", "einops", "loguru",
 )
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".m4v"}
@@ -88,7 +94,12 @@ MODEL_OPTIONS = (
     {
         "id": "large-v3",
         "label": "Large v3 — 日语歌曲、复杂音频（默认）",
-        "description": "日语歌曲、现场或背景声复杂的视频；精度优先，处理最慢。",
+        "description": "日语歌曲、现场或背景声复杂的视频；精度优先，处理时间较长。",
+    },
+    {
+        "id": LYRIC_MODEL,
+        "label": "歌词声学对齐 — 中日双语 MV（试验）",
+        "description": "按日文原词定位并生成中文轴；使用 MMS + TIFA，保留整曲音频。需要行数一致的中日歌词。",
     },
     {
         "id": "large-v3-turbo",
@@ -160,21 +171,42 @@ class _MessageBoxAdapter:
 messagebox = _MessageBoxAdapter()
 
 
+def _required_modules(config: dict) -> set[str]:
+    if config.get("model") == LYRIC_MODEL:
+        required = {
+            "torch", "transformers", "g2pflow", "fugashi", "unidic", "numba",
+            "librosa", "soundfile", "scipy", "omegaconf", "pydantic", "einops",
+            "loguru", "onnxruntime", "safetensors", "imageio_ffmpeg",
+        }
+        if config["audio_source"] == "vocals":
+            required.add("demucs")
+        return required
+    required = {"faster_whisper", "rapidfuzz", "imageio_ffmpeg"}
+    if config["audio_source"] == "vocals":
+        required.add("demucs")
+    if config.get("ocr_assist"):
+        required.update({"rapidocr", "onnxruntime"})
+    return required
+
+
 def _creation_flags() -> int:
     return subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
-def _candidate_pythons() -> list[tuple[str, str, int]]:
+def _candidate_pythons(include_align: bool = False) -> list[tuple[str, str, int]]:
     """列出候选解释器；返回 (路径, 来源, 优先级)。"""
     candidates: list[tuple[str, str, int]] = []
     override = os.environ.get("SUBTITLE_SYNC_PYTHON", "").strip()
     if override:
         candidates.append((override, "SUBTITLE_SYNC_PYTHON", 100))
 
-    project_roots = [APP_DIR]
-    if APP_DIR.name.lower() == "release":
-        project_roots.append(APP_DIR.parent)
+    project_roots = list(dict.fromkeys([APP_DIR, EXE_DIR]))
+    if EXE_DIR.name.lower() in {"release", "dist"}:
+        project_roots.append(EXE_DIR.parent)
     for root in project_roots:
+        if include_align:
+            align_executable = root / ".venv-align" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+            candidates.append((str(align_executable), "歌词对齐专用环境", 96))
         executable = (
             root / ".venv" / "Scripts" / "python.exe"
             if sys.platform == "win32"
@@ -223,12 +255,12 @@ def _candidate_pythons() -> list[tuple[str, str, int]]:
 
 def _probe_python(path: str, source: str, priority: int) -> dict:
     """在独立子进程中检查版本与本工具所需模块。"""
-    code = (
-        "import importlib.util,json,sys;"
-        f"names={list(PYTHON_MODULES)!r};"
-        "print(json.dumps({'version':list(sys.version_info[:3]),"
-        "'modules':{name:bool(importlib.util.find_spec(name)) for name in names}}))"
-    )
+    code = f"""
+import importlib.util, json, sys
+names = {list(PYTHON_MODULES)!r}
+modules = {{name: bool(importlib.util.find_spec(name)) for name in names}}
+print(json.dumps({{'version': list(sys.version_info[:3]), 'modules': modules}}))
+"""
     record = {
         "path": path,
         "source": source,
@@ -271,10 +303,11 @@ def _choose_python(probes: list[dict], required_modules: set[str]) -> dict | Non
     return max(usable, default=None, key=lambda item: item[:3])[3] if usable else None
 
 
-def _requirements_path() -> Path:
-    candidates = [APP_DIR / "requirements.txt", EXE_DIR.parent / "requirements.txt"]
+def _requirements_path(align: bool = False) -> Path:
+    filename = "requirements-align.txt" if align else "requirements.txt"
+    candidates = [APP_DIR / filename, EXE_DIR.parent / filename]
     if hasattr(sys, "_MEIPASS"):
-        candidates.append(Path(sys._MEIPASS) / "requirements.txt")
+        candidates.append(Path(sys._MEIPASS) / filename)
     return next((path for path in candidates if path.exists()), candidates[0])
 
 
@@ -282,7 +315,9 @@ def _find_python(required_modules: set[str]) -> tuple[dict, list[dict]]:
     """探测所有 Python，选择具备当前处理模式依赖的解释器。"""
     probes = [
         _probe_python(path, source, priority)
-        for path, source, priority in _candidate_pythons()
+        for path, source, priority in _candidate_pythons(
+            include_align="g2pflow" in required_modules,
+        )
     ]
     selected = _choose_python(probes, required_modules)
     if selected:
@@ -299,13 +334,13 @@ def _find_python(required_modules: set[str]) -> tuple[dict, list[dict]]:
         checked.append(
             f"- {probe['path']}（Python {version}，缺少: {', '.join(missing) or '无'}）"
         )
-    requirements = _requirements_path()
+    requirements = _requirements_path(align="g2pflow" in required_modules)
     best_path = probes[0]["path"] if probes else "python"
     raise RuntimeError(
         "没有找到可用的 Python 环境。\n\n"
         + ("已检查：\n" + "\n".join(checked) + "\n\n" if checked else "")
         + "安装所需组件：\n"
-        + f'"{best_path}" -m pip install -r "{requirements}"'
+        + f'"{best_path}" -X utf8 -m pip install -r "{requirements}"'
     )
 
 
@@ -362,6 +397,15 @@ def parse_runtime_line(raw_line: str) -> dict | None:
             "progress": 55 + round(current / total * 30),
         }
 
+    lyric_progress = re.match(r"^歌词对齐进度:\s*(\S+)\s+(\d+)/(\d+)$", line)
+    if lyric_progress:
+        phase, current, total = lyric_progress.groups()
+        low, high = (38, 59) if phase == "整曲定位" else (60, 77)
+        return {
+            "kind": "lyric_progress", "phase": phase, "count": int(current), "total": int(total),
+            "progress": low + round(int(current) / max(1, int(total)) * (high - low)),
+        }
+
     segment_match = re.match(r"^\[(\d{3})\]\s+\d+(?:\.\d+)?s\s*[→-]", line)
     if segment_match:
         return {"kind": "recognition", "count": int(segment_match.group(1))}
@@ -396,6 +440,15 @@ def parse_runtime_line(raw_line: str) -> dict | None:
     useful_prefixes = (
         "检测到",
         "复用 Whisper",
+        "复用转录",
+        "已有转录",
+        "转录缓存",
+        "正在加载歌词对齐模型",
+        "下载对齐资源:",
+        "歌词对齐完成:",
+        "复用歌词对齐缓存",
+        "复用整曲声学定位缓存",
+        "精对齐窗口",
         "复用 OCR",
         "已有 Whisper",
         "Whisper 识别完成",
@@ -425,6 +478,10 @@ def parse_runtime_line(raw_line: str) -> dict | None:
         "ModuleNotFoundError",
         "FileNotFoundError",
         "CUDA out of memory",
+        "memory allocation",
+        "RuntimeError:",
+        "ValueError:",
+        "ImportError:",
     )
     if cleaned.startswith(useful_prefixes) or any(
         fragment in cleaned for fragment in useful_error_fragments
@@ -457,13 +514,13 @@ def _build_processing_command(python_exe: str, config: dict) -> list[str]:
         "--model",
         config["model"],
     ]
-    if config.get("no_vad"):
+    if config.get("no_vad") and config["model"] != LYRIC_MODEL:
         command.append("--no-vad")
     if config.get("no_burn"):
         command.append("--no-burn")
     if config.get("refresh"):
         command.append("--refresh-transcript")
-    if config.get("ocr_assist"):
+    if config.get("ocr_assist") and config["model"] != LYRIC_MODEL:
         command.append("--ocr-assist")
         if config.get("refresh"):
             command.append("--refresh-ocr")
@@ -790,7 +847,7 @@ class App(QMainWindow):
         heading.setObjectName("sectionTitle")
         grid.addWidget(heading, 0, 0, 1, 4)
 
-        model_label = QLabel("语音模型")
+        model_label = QLabel("打轴方式")
         model_label.setObjectName("fieldLabel")
         self.model_combo = QComboBox()
         for index, option in enumerate(MODEL_OPTIONS):
@@ -825,7 +882,7 @@ class App(QMainWindow):
         self.no_burn_cb = QCheckBox("仅生成 SRT")
         self.no_burn_cb.setToolTip("生成 SRT 和对轴报告，不重新编码视频。识别步骤仍会运行。")
         self.refresh_cb = QCheckBox("重新识别")
-        self.refresh_cb.setToolTip("忽略已有 Whisper 缓存，重新提取音频并识别。")
+        self.refresh_cb.setToolTip("忽略已有转录缓存，重新提取音频并识别。")
         self.ocr_assist_cb = QCheckBox("画面歌词辅助")
         self.ocr_assist_cb.setToolTip(
             "视频画面本身带有歌词或硬字幕时，可用 OCR 校正局部漂移。\n"
@@ -838,6 +895,7 @@ class App(QMainWindow):
         grid.addWidget(self.ocr_assist_cb, 4, 1)
         grid.addWidget(self.no_vad_cb, 4, 2)
         grid.setColumnStretch(1, 1)
+        self._update_model_description()
         return card
 
     def _update_model_description(self) -> None:
@@ -848,6 +906,17 @@ class App(QMainWindow):
         self.model_description.setText(
             option["description"] + " 首次使用会自动下载并缓存。"
         )
+        self._update_engine_controls()
+
+    def _update_engine_controls(self) -> None:
+        if not hasattr(self, "no_vad_cb"):
+            return
+        acoustic = self.model_combo.currentData() == LYRIC_MODEL
+        self.no_vad_cb.setEnabled(not self.running and not acoustic)
+        self.ocr_assist_cb.setEnabled(not self.running and not acoustic)
+        self.refresh_cb.setText("重新对齐" if acoustic else "重新识别")
+        self.no_vad_cb.setToolTip("歌词声学对齐始终保留整曲音频，不使用 VAD 裁切。" if acoustic else "保留所有音频区间。")
+        self.ocr_assist_cb.setToolTip("歌词声学对齐使用音频与日文原词。" if acoustic else "用画面中已有的歌词校正局部漂移。")
 
     def _build_log_panel(self) -> QWidget:
         panel = QFrame()
@@ -1099,10 +1168,10 @@ class App(QMainWindow):
             "mode": mode,
             "audio_source": self.audio_source_combo.currentData(),
             "model": self.model_combo.currentData(),
-            "no_vad": self.no_vad_cb.isChecked(),
+            "no_vad": self.no_vad_cb.isChecked() and self.model_combo.currentData() != LYRIC_MODEL,
             "no_burn": self.no_burn_cb.isChecked(),
             "refresh": self.refresh_cb.isChecked(),
-            "ocr_assist": self.ocr_assist_cb.isChecked(),
+            "ocr_assist": self.ocr_assist_cb.isChecked() and self.model_combo.currentData() != LYRIC_MODEL,
         }
 
         if mode == "single":
@@ -1156,11 +1225,7 @@ class App(QMainWindow):
         ).start()
 
     def _prepare_and_run(self, config: dict) -> None:
-        required_modules = {"faster_whisper", "rapidfuzz"}
-        if config["audio_source"] == "vocals":
-            required_modules.add("demucs")
-        if config.get("ocr_assist"):
-            required_modules.update({"rapidocr", "onnxruntime"})
+        required_modules = _required_modules(config)
 
         try:
             selected_python, python_probes = _find_python(required_modules)
@@ -1334,6 +1399,9 @@ class App(QMainWindow):
                     f"扫描画面歌词 · {event['count']}/{event['total']}",
                     "working",
                 )
+            elif event["kind"] == "lyric_progress":
+                self.progress_bar.setValue(event["progress"])
+                self._apply_status(f"{event['phase']} · {event['count']}/{event['total']}", "working")
             elif event["kind"] == "log":
                 self._append_log(event["message"])
 
@@ -1364,6 +1432,7 @@ class App(QMainWindow):
         self.refresh_cb.setEnabled(not running)
         self.ocr_assist_cb.setEnabled(not running)
         self.no_vad_cb.setEnabled(not running)
+        self._update_engine_controls()
         if not running:
             self._elapsed_timer.stop()
 

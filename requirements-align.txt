@@ -1,0 +1,19 @@
+# -*- coding: utf-8 -*-
+# 歌词声学对齐的独立运行环境 .venv-align。
+# 已有兼容的 PyTorch 会直接复用，不切换计算平台。
+torch>=2.6,<3
+demucs>=4,<5
+transformers==5.22.1
+huggingface-hub>=1.0,<2
+safetensors>=0.8,<1
+numpy>=1.26,<3
+numba>=0.61,<1
+scipy>=1.10,<2
+librosa>=0.11,<0.12
+soundfile>=0.13,<0.14
+einops>=0.8,<1
+omegaconf>=2.3,<3
+pydantic>=2.11,<3
+g2pflow[ja,lstm]==0.3.1
+loguru>=0.7,<1
+imageio-ffmpeg>=0.5
