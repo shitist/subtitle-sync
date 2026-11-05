@@ -1,5 +1,8 @@
 # 日语歌曲字幕对轴工具
 
+[![版本](https://img.shields.io/github/v/release/shitist/subtitle-sync)](https://github.com/shitist/subtitle-sync/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 从日语歌曲视频提取音频，通过语音识别或歌词强制对齐确定时间轴，并把逐行中文字幕生成 SRT 或烧入视频。
 
 本工具用于把已有中文字幕对到音频时间轴，没有自动翻译功能，亦不是完整的字幕编辑器。
