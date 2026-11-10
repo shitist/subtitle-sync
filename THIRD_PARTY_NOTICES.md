@@ -4,6 +4,7 @@ Subtitle Sync 自身代码使用 MIT。下列第三方项目、模型和词典�
 
 | 资源 | 来源 | 许可 |
 |---|---|---|
+| Noto Sans CJK 字体 | [Noto CJK](https://github.com/notofonts/noto-cjk/releases/tag/Sans2.004) | SIL Open Font License 1.1；见 `assets/fonts/OFL.txt` |
 | MMS 日语卡拉 OK 对齐权重 | [NextFire/mms-300m-ForcedAligner-karaoke-ja-Latn](https://huggingface.co/NextFire/mms-300m-ForcedAligner-karaoke-ja-Latn) | CC BY-NC-SA 4.0 |
 | TIFA 代码 | [openvpi/TIFA](https://github.com/openvpi/TIFA) | MIT；下载的源码保留上游 LICENSE |
 | TIFA-1.0 预训练权重 | [TIFA v1.0.0](https://github.com/openvpi/TIFA/releases/tag/v1.0.0) | CC BY-NC-SA 4.0 |

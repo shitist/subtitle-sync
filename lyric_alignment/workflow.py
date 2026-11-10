@@ -111,7 +111,8 @@ def chinese_items(result: dict, lyrics, item_type) -> list:
     ) for item, line in zip(result["lines"], lyrics)]
 
 
-def process_known_lyrics(video, lyrics_path, output, *, audio_source, no_burn, refresh, helpers) -> None:
+def process_known_lyrics(video, lyrics_path, output, *, audio_source, no_burn, refresh, helpers,
+                         subtitle_font="noto-sc", subtitle_size=None) -> None:
     from .backend import align_audio, check_runtime
     helpers._banner(f"处理: {video.name}")
     helpers._step(1, 7, "加载中日歌词")
@@ -160,6 +161,7 @@ def process_known_lyrics(video, lyrics_path, output, *, audio_source, no_burn, r
         helpers._step(7, 7, "仅生成 SRT")
     else:
         helpers._step(7, 7, "FFmpeg 烧入硬字幕")
-        helpers.burn_subtitles(video, srt_path, output)
+        helpers.burn_subtitles(video, srt_path, output,
+                               subtitle_font=subtitle_font, subtitle_size=subtitle_size)
     print(f"  SRT 文件: {srt_path}\n  对轴报告: {report_path}", flush=True)
 

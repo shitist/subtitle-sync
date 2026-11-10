@@ -1,0 +1,19 @@
+Noto Sans CJK 2.004
+
+Unmodified static OpenType collections from the Noto CJK project.
+Developed by Adobe and Google. Copyright notices are preserved in the font
+metadata. Licensed under the SIL Open Font License 1.1; see OFL.txt.
+Copyright 2014-2021 Adobe (http://www.adobe.com/).
+
+Upstream: https://github.com/notofonts/noto-cjk
+Release: https://github.com/notofonts/noto-cjk/releases/tag/Sans2.004
+Files: Sans/OTC/NotoSansCJK-Regular.ttc and Sans/OTC/NotoSansCJK-Bold.ttc
+
+SHA256:
+NotoSansCJK-Regular.ttc
+b76b0433203017ca80401b2ee0dd69350349871c4b19d504c34dbdd80541690a
+NotoSansCJK-Bold.ttc
+faa5f3656a78b2e2d450d27fe8382c778bc2b6bb5ea29c986664a6a435056ceb
+
+The font collections and notices are bundled with Subtitle Sync. They are
+loaded from assets/fonts for subtitle rendering, not installed as system fonts.

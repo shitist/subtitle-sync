@@ -188,6 +188,7 @@ pip install -r requirements.txt
 - 语音模型与歌词声学对齐预设及适用场景说明
 - Demucs 人声或原始混合音频
 - 仅生成 SRT
+- 硬字幕字体与字号选择：Noto Sans 中文、Noto Sans 日文、微软雅黑
 - 强制重新运行 Whisper
 - 可选的 OCR 画面歌词辅助校准
 - 启用或禁用 VAD
@@ -298,6 +299,8 @@ Subtitle-tool/
 ├─ subtitle_sync.py          核心处理与命令行入口
 ├─ subtitle_sync_gui.py      PySide6 图形界面
 ├─ asr_models.py             语音模型与权重版本
+├─ subtitle_style.py         字幕字体预设与压制样式
+├─ assets/fonts/             内置 Noto Sans CJK 字体与许可
 ├─ lyric_alignment/          歌词声学对齐核心、模型资源与输出流程
 ├─ requirements.txt          识别和视频处理依赖
 ├─ requirements-gui.txt      源码运行与打包 GUI 的依赖

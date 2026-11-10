@@ -46,6 +46,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Optional
 from asr_models import LYRIC_MODEL, SUPPORTED_MODELS, model_label
+from subtitle_style import DEFAULT_FONT, FONT_PRESETS, apply_ass_style, font_settings, subtitle_filter
 # 强制禁止创建软链接，绕过 Windows 恶心的权限限制
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 
@@ -1750,40 +1751,25 @@ def save_alignment_report(
     return summary
 
 
-def burn_subtitles(video_path: Path, srt_path: Path, output_path: Path) -> None:
-    """
-    用 FFmpeg 将 SRT 字幕硬烧入视频。
-    字体: 微软雅黑 24pt，白字黑边，底部居中。
-    """
+def burn_subtitles(video_path: Path, srt_path: Path, output_path: Path, *,
+                   subtitle_font: str = DEFAULT_FONT, subtitle_size: float | None = None) -> None:
+    """用所选字体和字号压制硬字幕，版式沿用 FFmpeg 工具箱的 SRT 默认样式。"""
     ffmpeg_exe = _get_ffmpeg_path()
-
-    # Windows 路径需要转义冒号和反斜杠
-    srt_str = str(srt_path).replace("\\", "/").replace(":", "\\:")
-
-    style = (
-        "FontName=Microsoft YaHei,"
-        "FontSize=24,"
-        "PrimaryColour=&H00FFFFFF,"   # 白色
-        "OutlineColour=&H00000000,"   # 黑色描边
-        "BackColour=&H80000000,"      # 半透明黑色背景
-        "Bold=1,"
-        "Outline=2,"
-        "Shadow=1,"
-        "MarginV=35,"
-        "Alignment=2"                 # 底部居中
-    )
-
-    cmd = [
-        ffmpeg_exe, "-y",
-        "-i", str(video_path),
-        "-vf", f"subtitles='{srt_str}':force_style='{style}'",
-        "-c:v", "libx264",
-        "-crf", "18",
-        "-preset", "fast",
-        "-c:a", "copy",
-        str(output_path),
-    ]
-    _run(cmd, "FFmpeg 烧入字幕")
+    family, size = font_settings(subtitle_font, subtitle_size)
+    with tempfile.TemporaryDirectory(prefix="subtitle_style_") as temporary:
+        ass = Path(temporary) / "subtitle.ass"
+        _run([ffmpeg_exe, "-hide_banner", "-loglevel", "error", "-y",
+              "-sub_charenc", "UTF-8", "-i", str(srt_path), str(ass)], "转换字幕样式")
+        content = ass.read_text(encoding="utf-8-sig")
+        ass.write_text(apply_ass_style(content, subtitle_font, size), encoding="utf-8")
+        print(f"    字幕字体: {family}，字号: {size:g}", flush=True)
+        cmd = [
+            ffmpeg_exe, "-y", "-i", str(video_path),
+            "-vf", subtitle_filter(ass, subtitle_font),
+            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+            "-c:a", "copy", str(output_path),
+        ]
+        _run(cmd, "FFmpeg 烧入字幕")
 
 
 def _file_fingerprint(path: Path) -> dict:
@@ -1935,6 +1921,8 @@ def process_single(
     ocr_assist: bool = False,
     refresh_ocr: bool = False,
     ocr_sample_interval: float = DEFAULT_OCR_SAMPLE_INTERVAL,
+    subtitle_font: str = DEFAULT_FONT,
+    subtitle_size: float | None = None,
 ) -> None:
     """处理单个视频文件。"""
     video_path  = Path(video_path)
@@ -1957,6 +1945,7 @@ def process_single(
         return process_known_lyrics(
             video_path, lyrics_path, output_path, audio_source=audio_source,
             no_burn=no_burn, refresh=refresh_transcript, helpers=sys.modules[__name__],
+            subtitle_font=subtitle_font, subtitle_size=subtitle_size,
         )
 
     _banner(f"处理: {video_path.name}")
@@ -2054,7 +2043,8 @@ def process_single(
             _step(total_steps, total_steps, "仅生成 SRT，跳过视频烧录")
         else:
             _step(total_steps, total_steps, "FFmpeg 烧入硬字幕")
-            burn_subtitles(video_path, srt_path, output_path)
+            burn_subtitles(video_path, srt_path, output_path,
+                           subtitle_font=subtitle_font, subtitle_size=subtitle_size)
 
     print()
     if not no_burn:
@@ -2082,6 +2072,8 @@ def process_batch(
     ocr_assist: bool = False,
     refresh_ocr: bool = False,
     ocr_sample_interval: float = DEFAULT_OCR_SAMPLE_INTERVAL,
+    subtitle_font: str = DEFAULT_FONT,
+    subtitle_size: float | None = None,
 ) -> None:
     """批量处理目录下的所有视频文件。"""
     video_dir  = Path(video_dir)
@@ -2124,6 +2116,8 @@ def process_batch(
                 ocr_assist=ocr_assist,
                 refresh_ocr=refresh_ocr,
                 ocr_sample_interval=ocr_sample_interval,
+                subtitle_font=subtitle_font,
+                subtitle_size=subtitle_size,
             )
         except Exception as e:
             print(f"  ❌ 处理 {video_path.name} 时出错: {e}")
@@ -2248,6 +2242,10 @@ def main() -> None:
     parser.add_argument("--output",  help="输出视频路径（默认: 原文件名_subtitled + 原扩展名）")
     parser.add_argument("--no-vad",  action="store_true", help="禁用 VAD 静音过滤（不推荐）")
     parser.add_argument("--no-burn", action="store_true", help="只生成 SRT/报告，不烧录视频")
+    parser.add_argument("--subtitle-font", choices=tuple(FONT_PRESETS), default=DEFAULT_FONT,
+                        help="硬字幕字体：noto-sc（中文）、noto-jp（日文）、yahei（微软雅黑）")
+    parser.add_argument("--subtitle-size", type=float,
+                        help="硬字幕字号（6–96；默认 Noto 17.6、微软雅黑 16）")
     parser.add_argument(
         "--refresh-transcript",
         action="store_true",
@@ -2290,6 +2288,10 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    try:
+        font_settings(args.subtitle_font, args.subtitle_size)
+    except ValueError as error:
+        parser.error(str(error))
     if not 0 <= args.min_match_score <= 100:
         parser.error("--min-match-score 必须在 0 到 100 之间")
 
@@ -2308,6 +2310,8 @@ def main() -> None:
             min_match_score=args.min_match_score,
             ocr_assist=args.ocr_assist,
             refresh_ocr=args.refresh_ocr,
+            subtitle_font=args.subtitle_font,
+            subtitle_size=args.subtitle_size,
         )
     else:
         if not args.video or not args.lyrics:
@@ -2324,6 +2328,8 @@ def main() -> None:
             min_match_score=args.min_match_score,
             ocr_assist=args.ocr_assist,
             refresh_ocr=args.refresh_ocr,
+            subtitle_font=args.subtitle_font,
+            subtitle_size=args.subtitle_size,
         )
 
 

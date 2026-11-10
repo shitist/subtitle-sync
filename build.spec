@@ -13,6 +13,8 @@ a = Analysis(
     datas=[
         (str(_project / "subtitle_sync.py"), "."),
         (str(_project / "asr_models.py"), "."),
+        (str(_project / "subtitle_style.py"), "."),
+        (str(_project / "assets" / "fonts"), "assets/fonts"),
         (str(_project / "requirements.txt"), "."),
         (str(_project / "requirements-align.txt"), "."),
         *[(str(file), "lyric_alignment") for file in (_project / "lyric_alignment").glob("*.py")],

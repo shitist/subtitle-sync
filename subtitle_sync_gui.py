@@ -14,13 +14,15 @@ import time
 from datetime import datetime
 from pathlib import Path
 from asr_models import LYRIC_MODEL
+from subtitle_style import DEFAULT_FONT, FONT_PRESETS
 
 from PySide6.QtCore import QObject, QSettings, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont, QPalette
+from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont, QFontDatabase, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -518,6 +520,10 @@ def _build_processing_command(python_exe: str, config: dict) -> list[str]:
         command.append("--no-vad")
     if config.get("no_burn"):
         command.append("--no-burn")
+    else:
+        font = config.get("subtitle_font", DEFAULT_FONT)
+        command += ["--subtitle-font", font, "--subtitle-size",
+                    str(config.get("subtitle_size", FONT_PRESETS[font]["size"]))]
     if config.get("refresh"):
         command.append("--refresh-transcript")
     if config.get("ocr_assist") and config["model"] != LYRIC_MODEL:
@@ -894,9 +900,46 @@ class App(QMainWindow):
         grid.addWidget(self.refresh_cb, 3, 3)
         grid.addWidget(self.ocr_assist_cb, 4, 1)
         grid.addWidget(self.no_vad_cb, 4, 2)
+
+        self.subtitle_font_combo = QComboBox()
+        installed = set(QFontDatabase.families())
+        for key, preset in FONT_PRESETS.items():
+            if key != "yahei" or preset["family"] in installed:
+                self.subtitle_font_combo.addItem(preset["label"], key)
+        saved_font = self._settings.value("subtitles/font", DEFAULT_FONT)
+        saved_index = self.subtitle_font_combo.findData(saved_font)
+        self.subtitle_font_combo.setCurrentIndex(max(0, saved_index))
+        self.subtitle_size_spin = QDoubleSpinBox()
+        self.subtitle_size_spin.setRange(6, 96)
+        self.subtitle_size_spin.setDecimals(1)
+        self.subtitle_size_spin.setSingleStep(0.5)
+        default_size = FONT_PRESETS[self.subtitle_font_combo.currentData()]["size"]
+        self.subtitle_size_spin.setValue(float(self._settings.value("subtitles/size", default_size)))
+        self.subtitle_size_spin.setToolTip("ASS 相对字号，与 FFmpeg 工具箱一致。")
+        grid.addWidget(QLabel("字幕字体"), 5, 0)
+        grid.addWidget(self.subtitle_font_combo, 5, 1)
+        grid.addWidget(QLabel("字号"), 5, 2)
+        grid.addWidget(self.subtitle_size_spin, 5, 3)
+        self.subtitle_font_combo.currentIndexChanged.connect(self._subtitle_font_changed)
+        self.subtitle_size_spin.valueChanged.connect(self._remember_subtitle_style)
+        self.no_burn_cb.toggled.connect(self._update_subtitle_controls)
+        self._update_subtitle_controls()
         grid.setColumnStretch(1, 1)
         self._update_model_description()
         return card
+
+    def _subtitle_font_changed(self) -> None:
+        self.subtitle_size_spin.setValue(FONT_PRESETS[self.subtitle_font_combo.currentData()]["size"])
+        self._remember_subtitle_style()
+
+    def _remember_subtitle_style(self) -> None:
+        self._settings.setValue("subtitles/font", self.subtitle_font_combo.currentData())
+        self._settings.setValue("subtitles/size", self.subtitle_size_spin.value())
+
+    def _update_subtitle_controls(self) -> None:
+        enabled = not self.running and not self.no_burn_cb.isChecked()
+        self.subtitle_font_combo.setEnabled(enabled)
+        self.subtitle_size_spin.setEnabled(enabled)
 
     def _update_model_description(self) -> None:
         if not hasattr(self, "model_description"):
@@ -1025,14 +1068,14 @@ class App(QMainWindow):
                 background: {c['surface']};
                 border-top: 1px solid {c['border']};
             }}
-            QLineEdit, QComboBox, QPlainTextEdit {{
+            QLineEdit, QComboBox, QDoubleSpinBox, QPlainTextEdit {{
                 background: {c['surface_alt']};
                 border: 1px solid {c['border']};
                 border-radius: 6px;
                 padding: 7px 9px;
                 selection-background-color: {c['selection']};
             }}
-            QLineEdit:focus, QComboBox:focus, QPlainTextEdit:focus {{
+            QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus, QPlainTextEdit:focus {{
                 border-color: {c['accent']};
             }}
             QComboBox {{ padding-right: 24px; }}
@@ -1172,6 +1215,8 @@ class App(QMainWindow):
             "no_burn": self.no_burn_cb.isChecked(),
             "refresh": self.refresh_cb.isChecked(),
             "ocr_assist": self.ocr_assist_cb.isChecked() and self.model_combo.currentData() != LYRIC_MODEL,
+            "subtitle_font": self.subtitle_font_combo.currentData(),
+            "subtitle_size": self.subtitle_size_spin.value(),
         }
 
         if mode == "single":
@@ -1265,6 +1310,8 @@ class App(QMainWindow):
             "audio_source": config["audio_source"],
             "model": config["model"],
             "ocr_assist": config.get("ocr_assist", False),
+            "subtitle_font": config.get("subtitle_font", DEFAULT_FONT),
+            "subtitle_size": config.get("subtitle_size"),
             "required_modules": sorted(required_modules),
             "selected_python": selected_python,
             "python_candidates": python_probes,
@@ -1433,6 +1480,7 @@ class App(QMainWindow):
         self.ocr_assist_cb.setEnabled(not running)
         self.no_vad_cb.setEnabled(not running)
         self._update_engine_controls()
+        self._update_subtitle_controls()
         if not running:
             self._elapsed_timer.stop()
 
