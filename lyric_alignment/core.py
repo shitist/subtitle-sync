@@ -36,11 +36,13 @@ def normalize_roman(text: str) -> str:
     return re.sub(r"\s+", " ", re.sub("[^a-z']", " ", text)).strip()
 
 
-def make_targets(roman_lines: list[str], vocab: dict[str, int]) -> tuple[np.ndarray, np.ndarray]:
+def make_targets(roman_lines: list[str], vocab: dict[str, int], *, allow_empty: bool = False) -> tuple[np.ndarray, np.ndarray]:
     tokens, owners = [], []
     for line_id, text in enumerate(roman_lines):
         normalized = normalize_roman(text)
         if not normalized:
+            if allow_empty:
+                continue
             raise ValueError(f"第 {line_id + 1} 行无法转换为模型支持的读音")
         if tokens:
             tokens.append(vocab["|"])

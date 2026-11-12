@@ -20,7 +20,7 @@ from .resources import MMS_REPO, MMS_REVISION, TIFA_COMMIT, prepare_mms, prepare
 
 def check_runtime() -> None:
     import importlib
-    modules = ("torch", "transformers", "g2pflow", "fugashi", "unidic", "numba", "librosa", "soundfile", "omegaconf", "pydantic", "einops", "onnxruntime")
+    modules = ("torch", "transformers", "g2pflow", "fugashi", "unidic", "numba", "num2words", "librosa", "soundfile", "omegaconf", "pydantic", "einops", "onnxruntime")
     missing = []
     for name in modules:
         try:
@@ -69,6 +69,9 @@ def _pipeline(config, model_dir):
 
 
 def roman_units(word) -> list[str]:
+    from .numbers import NumberWord
+    if isinstance(word, NumberWord):
+        return normalize_roman(word.romans[word.chosen]).split()
     # English labels are the original alphabetic words used by this karaoke
     # checkpoint. Japanese pronunciation groups come from the MeCab reading.
     if re.fullmatch(r"[A-Za-z0-9'’\- ]+", word.text):
@@ -90,6 +93,9 @@ def roman_units(word) -> list[str]:
 
 
 def _roman_word(word) -> str:
+    from .numbers import NumberWord
+    if isinstance(word, NumberWord):
+        return normalize_roman(word.romans[word.chosen])
     if re.fullmatch(r"[A-Za-z0-9'’\- ]+", word.text):
         return normalize_roman(word.text)
     groups = word.readings[0].paths[0]
@@ -109,28 +115,101 @@ def spoken_text(text: str) -> str:
     # Explicit kana reading, e.g. 声明(こえ), replaces that word's reading only.
     # This normalization is internal; source/translation output is kept verbatim.
     text = re.sub(r"[一-龯々]+\(([ぁ-ゖァ-ヺー]+)\)", r"\1", text)
+    from .numbers import number_spans
+    numeric = {i for start, end in number_spans(text) for i in range(start, end)}
     result = []
     for index, char in enumerate(text):
         internal_apostrophe = char == "'" and 0 < index < len(text) - 1 and text[index - 1].isascii() and text[index - 1].isalpha() and text[index + 1].isascii() and text[index + 1].isalpha()
-        result.append(" " if unicodedata.category(char).startswith(("S", "P")) and not internal_apostrophe else char)
+        result.append(" " if unicodedata.category(char).startswith(("S", "P"))
+                      and not internal_apostrophe and index not in numeric else char)
     return "".join(result)
 
 
-def prepare_pronunciations(pipeline, source_lines: list[str]):
+def _convert_available_words(pipeline, text: str, *, causes: list | None = None):
+    """Retry only unclaimed input spans; retain every convertible word in order."""
+    from g2pflow.converters.base import G2PConversionError
+    from .numbers import convert_numbers
+    remaining = spoken_text(text)
+    skipped = []
+    while remaining.strip():
+        try:
+            return convert_numbers(remaining, pipeline, _roman_word, spoken_text), remaining, skipped
+        except G2PConversionError as error:
+            if causes is not None and error.reason:
+                causes.append(error.reason)
+            previous = remaining
+            for token in error.unconverted_tokens:
+                pattern = r"\s+".join(re.escape(part) for part in token.split())
+                if not pattern:
+                    continue
+                pattern = r"(?<![A-Za-z0-9])" + pattern + r"(?![A-Za-z0-9])"
+                matches = list(re.finditer(pattern, remaining, flags=re.IGNORECASE))
+                skipped.extend(match.group().strip() for match in matches)
+                remaining = re.sub(pattern, lambda match: " " * len(match.group()), remaining,
+                                   flags=re.IGNORECASE)
+            if remaining == previous:
+                # The converter may return a transformed token with no source
+                # offsets. Mark this line unresolved rather than dropping other lines.
+                skipped.append(remaining.strip())
+                return [], "", skipped
+    return [], "", skipped
+
+
+def prepare_pronunciations(pipeline, source_lines: list[str], *, issues: list | None = None):
     words_by_line, roman_lines = [], []
     for line_id, text in enumerate(source_lines):
         if not text.strip():
             raise ValueError(f"第 {line_id + 1} 行缺少日文原词")
         try:
-            words = pipeline.convert(spoken_text(text), languages=["ja", "en"])
+            causes = []
+            words, alignment_text, skipped = _convert_available_words(pipeline, text, causes=causes)
             roman = normalize_roman(" ".join(_roman_word(word) for word in words))
         except Exception as error:
             raise ValueError(f"第 {line_id + 1} 行读音转换失败: {text}\n{error}") from error
-        if not words or not roman:
-            raise ValueError(f"第 {line_id + 1} 行没有可对齐的发音: {text}")
+        if skipped or not words or not roman:
+            spoken = spoken_text(text)
+            missing_start = (len(alignment_text) - len(alignment_text.lstrip())
+                             > len(spoken) - len(spoken.lstrip())) if alignment_text.strip() else True
+            missing_end = len(alignment_text.rstrip()) < len(spoken.rstrip()) if alignment_text.strip() else True
+            issue = {"line_id": line_id, "source": text, "unconverted_tokens": skipped,
+                     "alignment_text": alignment_text, "missing_start": missing_start, "missing_end": missing_end,
+                     "status": "partial" if words and roman else "unresolved"}
+            if issues is not None:
+                issues.append(issue)
+            detail = "、".join(skipped) or text
+            if causes:
+                reason = " ".join(dict.fromkeys(causes))
+            elif any(re.search(r"[A-Za-z]", token) and re.search(r"\d", token) for token in skipped):
+                reason = f"模型不支持 {detail} 中的数字。"
+            elif skipped and all(re.fullmatch(r"[\d\s,.+-]+", token) for token in skipped):
+                reason = "缺少数字读音规则。"
+            else:
+                reason = f"找不到 {detail} 的读音。"
+            issue["reason"] = reason
+            print(f"    第 {line_id + 1} 行：{reason}", flush=True)
+            if not words or not roman:
+                words, roman = [], ""
         words_by_line.append(words)
         roman_lines.append(roman)
     return words_by_line, roman_lines
+
+
+def _mark_pronunciation_issues(lines, issues):
+    by_id = {issue["line_id"]: issue for issue in issues}
+    for line in lines:
+        issue = by_id.get(line.line_id)
+        if issue is None:
+            continue
+        if issue["status"] == "unresolved":
+            if "g2p_unresolved" not in line.flags:
+                line.flags.append("g2p_unresolved")
+            line.start = line.end = None
+            line.stage = "unresolved"
+        else:
+            for boundary in ("start", "end"):
+                flag = "g2p_missing_" + boundary
+                if issue["missing_" + boundary] and flag not in line.flags:
+                    line.flags.append(flag)
 
 
 def read_audio(path: Path, sample_rate: int) -> np.ndarray:
@@ -240,6 +319,72 @@ def _refine_window(backend, vocabulary, audio, words_by_line, window, coarse, *,
             phone_records, float(aligned.agreement[0]))
 
 
+def _reading_likelihood(values, roman_lines, vocab):
+    targets, _ = make_targets(roman_lines, vocab, allow_empty=True)
+    try:
+        path = decode_frames(values, targets, vocab["[PAD]"])
+    except ValueError:
+        return -np.inf
+    emitted = np.where(path >= 0, targets[np.maximum(path, 0)], vocab["[PAD]"])
+    return float(values[np.arange(len(values)), emitted].mean())
+
+
+def select_number_readings(values, times, vocab, words_by_line, coarse, progress):
+    from .numbers import NumberWord
+    duration = float(times[-1] + (times[1] - times[0] if len(times) > 1 else .02))
+    numbered = [(line_id, words) for line_id, words in enumerate(words_by_line)
+                if any(isinstance(word, NumberWord) for word in words)]
+    records = []
+    for position, (line_id, words) in enumerate(numbered):
+        previous = next((line for line in reversed(coarse[:line_id]) if line.start is not None), None)
+        following = next((line for line in coarse[line_id + 1:] if line.end is not None), None)
+        first, last = previous.line_id if previous else line_id, following.line_id if following else line_id
+        low = previous.start if previous else 0.0
+        high = following.end if following else duration
+        low, high = max(0.0, low), min(duration, high)
+        if high <= low:
+            raise ValueError(f"第 {line_id + 1} 行：数字音频区间为空")
+        excerpt = values[np.searchsorted(times, low):np.searchsorted(times, high, side="right")]
+        context = words_by_line[first:last + 1]
+        numeric_indices = [index for index, word in enumerate(words) if isinstance(word, NumberWord)]
+        def score():
+            romans = [normalize_roman(" ".join(_roman_word(word) for word in row)) for row in context]
+            return _reading_likelihood(excerpt, romans, vocab)
+        # Beam search preserves joint numeric choices within a line. Each
+        # candidate is scored on the same audio frames, including blank frames.
+        beam = [(0.0, ())]
+        for offset, index in enumerate(numeric_indices):
+            expanded = []
+            for _, prefix in beam:
+                for previous_index, choice in zip(numeric_indices, prefix):
+                    words[previous_index].chosen = choice
+                for choice in range(len(words[index].readings)):
+                    words[index].chosen = choice
+                    expanded.append((score(), prefix + (choice,)))
+            beam = sorted(expanded, key=lambda item: (-item[0], item[1]))[:8]
+        best_score, choices = beam[0]
+        if not np.isfinite(best_score):
+            raise ValueError(f"第 {line_id + 1} 行：数字音频区间没有匹配读音")
+        for index, choice in zip(numeric_indices, choices):
+            words[index].chosen = choice
+        for index, choice in zip(numeric_indices, choices):
+            word = words[index]
+            scores = []
+            for candidate in range(len(word.readings)):
+                word.chosen = candidate
+                value = score()
+                scores.append(value if np.isfinite(value) else None)
+            word.chosen = choice
+            records.append({"line_id": line_id, "word_index": index, "text": word.text,
+                            "reading": word.labels[choice], "roman": word.romans[choice],
+                            "window": [low, high], "method": "mms_frame_likelihood",
+                            "candidates": [{"reading": label, "roman": roman, "score": value}
+                                           for label, roman, value in zip(word.labels, word.romans, scores)]})
+            word.select(choice)
+        progress("数字读音", position + 1, len(numbered))
+    return records
+
+
 def align_audio(audio_path: Path, source_lines: list[str], progress=None, *, coarse_cache=None, checkpoint=None,
                 frame_checkpoint=None) -> dict:
     """Only source lyrics and audio enter inference; Chinese/reference SRT never do."""
@@ -251,12 +396,22 @@ def align_audio(audio_path: Path, source_lines: list[str], progress=None, *, coa
     torch.set_num_threads(min(6, torch.get_num_threads()))
     print("    正在加载歌词对齐模型（FP32）", flush=True)
     source, model_dir = prepare_tifa()
-    mms_path = prepare_mms()
     _, config = _load_tifa_config(source, model_dir)
     pipeline = _pipeline(config, model_dir)
-    words_by_line, roman_lines = prepare_pronunciations(pipeline, source_lines)
+    pronunciation_issues = []
+    words_by_line, roman_lines = prepare_pronunciations(pipeline, source_lines, issues=pronunciation_issues)
+    from .numbers import NumberWord
+    has_numbers = any(isinstance(word, NumberWord) for words in words_by_line for word in words)
+    if has_numbers:
+        coarse_cache = None
     audio16 = read_audio(audio_path, 16000)
     duration = len(audio16) / 16000
+    if not any(roman_lines):
+        lines = [LineSpan(index, None, None, "unresolved", flags=["g2p_unresolved"])
+                 for index in range(len(source_lines))]
+        return {"profile": PROFILE, "duration": duration, "romanized_lines": roman_lines,
+                "pronunciation_issues": pronunciation_issues, "lines": [line.record() for line in lines]}
+    mms_path = prepare_mms()
     coarse = None
     if coarse_cache and coarse_cache.get("romanized_lines") == roman_lines and abs(coarse_cache.get("duration", -1) - duration) < 0.001:
         try:
@@ -273,23 +428,38 @@ def align_audio(audio_path: Path, source_lines: list[str], progress=None, *, coa
             frame_checkpoint(values, times, frame_step)
         import json
         vocab = json.loads((mms_path / "vocab.json").read_text(encoding="utf-8"))
-        targets, owners = make_targets(roman_lines, vocab)
+        targets, owners = make_targets(roman_lines, vocab, allow_empty=True)
+        path = decode_frames(values, targets, vocab["[PAD]"])
+        coarse = coarse_lines(path, owners, values, targets, times, frame_step, len(source_lines))
+        del path
+        if not has_numbers:
+            del values
+    backend = vocabulary = audio48 = None
+    number_readings = []
+    if has_numbers:
+        number_readings = select_number_readings(values, times, vocab, words_by_line, coarse, progress)
+        roman_lines = [normalize_roman(" ".join(_roman_word(word) for word in words)) for words in words_by_line]
+        targets, owners = make_targets(roman_lines, vocab, allow_empty=True)
         path = decode_frames(values, targets, vocab["[PAD]"])
         coarse = coarse_lines(path, owners, values, targets, times, frame_step, len(source_lines))
         del values, path
+    _mark_pronunciation_issues(coarse, pronunciation_issues)
     base_result = {
         "profile": PROFILE, "coarse_profile": COARSE_PROFILE, "precision": "float32", "duration": duration,
         "runtime": {name: version(name) for name in ("torch", "transformers", "g2pflow", "numpy", "numba")},
         "models": {"coarse": MMS_REPO, "coarse_revision": MMS_REVISION, "refiner": "TIFA-1.0", "tifa_code": TIFA_COMMIT},
         "romanized_lines": roman_lines, "coarse": [item.record() for item in coarse],
+        "pronunciation_issues": pronunciation_issues,
+        "number_readings": number_readings,
     }
     if checkpoint:
         checkpoint(base_result)
     windows = plan_windows(coarse, duration)
     del audio16
     gc.collect()
-    backend, vocabulary, _ = _load_tifa(source, model_dir)
-    audio48 = read_audio(audio_path, backend.sample_rate)
+    if backend is None:
+        backend, vocabulary, _ = _load_tifa(source, model_dir)
+        audio48 = read_audio(audio_path, backend.sample_rate)
     refined = []
     window_records = []
     for index, window in enumerate(windows):
@@ -303,6 +473,7 @@ def align_audio(audio_path: Path, source_lines: list[str], progress=None, *, coa
             print(f"    精对齐窗口 {index + 1} 失败: {error}", flush=True)
         progress("逐句精对齐", index + 1, len(windows))
     result = merge_refinement(coarse, refined, duration)
+    _mark_pronunciation_issues(result, pronunciation_issues)
     return {
         **base_result,
         "refinement": [item.record() for item in refined],

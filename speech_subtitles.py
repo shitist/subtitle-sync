@@ -122,7 +122,7 @@ def refine(audio_path: Path, transcript: dict) -> tuple[list[dict], dict]:
     if not segments:
         return [], report
     if not model_id:
-        print(f"    注意：{language_label(language)} 尚未配置对齐模型，使用 Whisper 原生词级时间。", flush=True)
+        print(f"    对齐模型: {language_label(language)} 没有配置模型。", flush=True)
         words = []
         for original in segments:
             selected, _ = choose_words(original, None)
@@ -176,8 +176,6 @@ def refine(audio_path: Path, transcript: dict) -> tuple[list[dict], dict]:
         gc.collect()
         if device == "cuda":
             torch.cuda.empty_cache()
-    if report["asr_segments"]:
-        print(f"    注意：{report['asr_segments']} 个片段保留 Whisper 原始时间，详情见对轴报告。", flush=True)
     return all_words, report
 
 

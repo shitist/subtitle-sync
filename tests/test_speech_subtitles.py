@@ -161,7 +161,7 @@ class SpeechGuiTests(unittest.TestCase):
     def test_all_whisper_languages_are_available(self):
         self.assertEqual(self.window.language_combo.count(), len(catalog.LANGUAGE_CODES) + 1)
         self.window.language_combo.setCurrentIndex(self.window.language_combo.findData("yue"))
-        self.assertIn("Whisper 原生", self.window.language_combo.toolTip())
+        self.assertIn("没有配置声学对齐模型", self.window.language_combo.toolTip())
         self.assertFalse(hasattr(self.window, "alignment_description"))
 
     def test_batch_copy_matches_single_file(self):

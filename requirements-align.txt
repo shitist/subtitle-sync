@@ -8,6 +8,7 @@ huggingface-hub>=1.0,<2
 safetensors>=0.8,<1
 numpy>=1.26,<3
 numba>=0.61,<1
+num2words==0.5.14
 scipy>=1.10,<2
 librosa>=0.11,<0.12
 soundfile>=0.13,<0.14

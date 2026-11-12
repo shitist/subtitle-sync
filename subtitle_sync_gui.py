@@ -83,7 +83,7 @@ PYTHON_MODULES = (
     "librosa",
     "safetensors",
     "g2pflow", "fugashi", "unidic", "numba", "scipy", "soundfile",
-    "omegaconf", "pydantic", "einops", "loguru",
+    "omegaconf", "pydantic", "einops", "loguru", "num2words",
     "whisperx", "torchaudio", "pandas", "nltk",
 )
 
@@ -183,7 +183,7 @@ def _required_modules(config: dict) -> set[str]:
         required = {
             "torch", "transformers", "g2pflow", "fugashi", "unidic", "numba",
             "librosa", "soundfile", "scipy", "omegaconf", "pydantic", "einops",
-            "loguru", "onnxruntime", "safetensors", "imageio_ffmpeg",
+            "loguru", "onnxruntime", "safetensors", "imageio_ffmpeg", "num2words",
         }
         if config["audio_source"] == "vocals":
             required.add("demucs")
@@ -412,7 +412,7 @@ def parse_runtime_line(raw_line: str) -> dict | None:
     lyric_progress = re.match(r"^歌词对齐进度:\s*(\S+)\s+(\d+)/(\d+)$", line)
     if lyric_progress:
         phase, current, total = lyric_progress.groups()
-        low, high = (38, 59) if phase == "整曲定位" else (60, 77)
+        low, high = (38, 59) if phase == "整曲定位" else (59, 62) if phase == "数字读音" else (62, 77)
         return {
             "kind": "lyric_progress", "phase": phase, "count": int(current), "total": int(total),
             "progress": low + round(int(current) / max(1, int(total)) * (high - low)),
@@ -456,6 +456,8 @@ def parse_runtime_line(raw_line: str) -> dict | None:
     for source, target in replacements.items():
         cleaned = cleaned.replace(source, target)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if re.match(r"^第\s*[\d, ]+\s*行：", cleaned):
+        return {"kind": "log", "message": cleaned}
 
     if cleaned.startswith("处理:"):
         return {"kind": "log", "message": "文件：" + cleaned.removeprefix("处理:").strip()}
@@ -475,6 +477,7 @@ def parse_runtime_line(raw_line: str) -> dict | None:
         "正在加载歌词对齐模型",
         "下载对齐资源:",
         "歌词对齐完成:",
+        "字幕生成：",
         "复用歌词对齐缓存",
         "复用整曲声学定位缓存",
         "精对齐窗口",
@@ -863,23 +866,22 @@ class App(QMainWindow):
         self.audio_source_combo.addItem("分离人声（较慢）", "vocals")
         self.audio_source_combo.addItem("原始音频（较快）", "original")
         self.audio_source_combo.setToolTip(
-            "分离人声会先去掉大部分伴奏，通常更适合歌曲识别，但处理时间更长。\n"
-            "原始音频会直接识别视频中的混音。"
+            "分离人声：提取人声后打轴。\n"
+            "原始音频：使用视频中的混合音频打轴。"
         )
         grid.addWidget(source_label, 3, 0)
         grid.addWidget(self.audio_source_combo, 3, 1)
 
         self.no_burn_cb = QCheckBox("仅生成 SRT")
-        self.no_burn_cb.setToolTip("生成 SRT 和对轴报告，不重新编码视频。识别步骤仍会运行。")
+        self.no_burn_cb.setToolTip("生成 SRT 和对轴报告。")
         self.refresh_cb = QCheckBox("重新识别")
         self.refresh_cb.setToolTip("忽略已有转录缓存，重新提取音频并识别。")
         self.ocr_assist_cb = QCheckBox("画面歌词辅助")
         self.ocr_assist_cb.setToolTip(
-            "视频画面本身带有歌词或硬字幕时，可用 OCR 校正局部漂移。\n"
-            "会增加数分钟处理时间；没有画面文字时请勿开启。"
+            "识别画面歌词并校正字幕时间。"
         )
         self.no_vad_cb = QCheckBox("禁用 VAD")
-        self.no_vad_cb.setToolTip("保留所有音频区间。通常无需开启。")
+        self.no_vad_cb.setToolTip("保留所有音频区间。")
         self.option_checks = QWidget()
         checks_layout = QHBoxLayout(self.option_checks)
         checks_layout.setContentsMargins(0, 0, 0, 0)
@@ -968,7 +970,7 @@ class App(QMainWindow):
     def _update_language_hint(self) -> None:
         language = self.language_combo.currentData()
         self.language_combo.setToolTip(
-            "该语言使用 Whisper 原生词级时间。" if language != "auto" and language not in ALIGN_MODELS
+            "该语言没有配置声学对齐模型。" if language != "auto" and language not in ALIGN_MODELS
             else "选择视频中的主要语言，或使用自动检测。"
         )
 
@@ -1400,6 +1402,7 @@ class App(QMainWindow):
         run_log_path = Path(run_context["run_log_path"])
         exit_code = None
         status = "failed"
+        failure_detail = ""
 
         def update_diagnostics(**changes) -> None:
             run_context.update(changes)
@@ -1447,6 +1450,8 @@ class App(QMainWindow):
                 if process.stdout is not None:
                     with process.stdout:
                         for line in process.stdout:
+                            if re.match(r"^\w*(?:Error|Exception):", line.strip()):
+                                failure_detail = line.strip()
                             emit(line)
                 exit_code = process.wait()
 
@@ -1463,7 +1468,7 @@ class App(QMainWindow):
                     self._show_message(
                         "error",
                         "处理失败",
-                        "处理没有完成。界面中保留了错误摘要，完整信息可在日志目录中查看。",
+                        failure_detail or f"处理程序退出，返回码 {exit_code}。",
                     )
         except Exception as error:
             status = "launch_failed"

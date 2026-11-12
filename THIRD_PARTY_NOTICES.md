@@ -14,6 +14,7 @@ Subtitle Sync 项目代码采用 [MIT License](LICENSE)。
 | Demucs | [facebookresearch/demucs](https://github.com/facebookresearch/demucs/blob/main/LICENSE) | MIT |
 | RapidOCR | [RapidAI/RapidOCR](https://github.com/RapidAI/RapidOCR/blob/main/LICENSE) | Apache-2.0 |
 | ONNX Runtime | [microsoft/onnxruntime](https://github.com/microsoft/onnxruntime/blob/main/LICENSE) | MIT |
+| num2words | [savoirfairelinux/num2words](https://github.com/savoirfairelinux/num2words/blob/master/COPYING) | LGPL-2.1 |
 | TIFA 代码 | [openvpi/TIFA](https://github.com/openvpi/TIFA/blob/7b210ca36ff5a2b79187fb1727af58fc977cc301/LICENSE) | MIT |
 | g2pflow 0.3.1 | [openvpi/g2pflow](https://github.com/openvpi/g2pflow/tree/v0.3.1) | 主代码 MIT；安装包内其他代码和词典包含 Apache-2.0、CC BY-SA 3.0、CC BY-SA 4.0，见包内许可文件 |
 | FFmpeg | [FFmpeg 许可](https://ffmpeg.org/legal.html) | LGPL-2.1+；启用 GPL 组件的构建采用 GPL，具体见所用二进制的构建信息 |

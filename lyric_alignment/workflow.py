@@ -26,13 +26,18 @@ def _write_json(path: Path, payload: dict) -> None:
 
 
 def cache_metadata(video: Path, source_lines: list[str], audio_source: str, fingerprint) -> dict:
-    return {
+    import unicodedata
+    from .numbers import RULES_VERSION, number_spans
+    metadata = {
         "schema": SCHEMA, "profile": PROFILE,
         "video": fingerprint(video), "audio_source": audio_source,
         "source_sha256": hashlib.sha256(json.dumps(source_lines, ensure_ascii=False).encode("utf-8")).hexdigest(),
         "mms_revision": MMS_REVISION, "tifa_code": TIFA_COMMIT,
         "precision": "float32", "timeline": "copyts-start-at-zero-aresample-v1",
     }
+    if any(number_spans(unicodedata.normalize("NFKC", line)) for line in source_lines):
+        metadata["numeric_readings"] = RULES_VERSION
+    return metadata
 
 
 def valid_result(result: dict, count: int) -> bool:
@@ -41,10 +46,14 @@ def valid_result(result: dict, count: int) -> bool:
         duration = result["duration"]
         return len(lines) == count and all(
             item["line_id"] == index
-            and isinstance(item["start"], (int, float)) and isinstance(item["end"], (int, float))
-            and math.isfinite(item["start"]) and math.isfinite(item["end"])
-            and 0 <= item["start"] < item["end"] <= duration + 0.05
-            and item["stage"] in {"refined", "coarse_only"}
+            and (
+                item["stage"] == "unresolved" and item["start"] is None and item["end"] is None
+                and "g2p_unresolved" in item.get("flags", [])
+                or item["stage"] in {"refined", "coarse_only"}
+                and isinstance(item["start"], (int, float)) and isinstance(item["end"], (int, float))
+                and math.isfinite(item["start"]) and math.isfinite(item["end"])
+                and 0 <= item["start"] < item["end"] <= duration + 0.05
+            )
             for index, item in enumerate(lines)
         )
     except (KeyError, TypeError, ValueError):
@@ -108,7 +117,7 @@ def chinese_items(result: dict, lyrics, item_type) -> list:
         start=item["start"], end=item["end"], text=line.zh, source_text=line.ja,
         status="acoustic_refined" if item["stage"] == "refined" else "acoustic_coarse",
         review_reason=",".join(item.get("flags", [])),
-    ) for item, line in zip(result["lines"], lyrics)]
+    ) for item, line in zip(result["lines"], lyrics) if item["stage"] != "unresolved"]
 
 
 def process_known_lyrics(video, lyrics_path, output, *, audio_source, no_burn, refresh, helpers,
@@ -146,17 +155,19 @@ def process_known_lyrics(video, lyrics_path, output, *, audio_source, no_burn, r
         "mode": "lyrics_acoustic", "lines": len(lyrics),
         "refined_lines": sum(item.get("stage") == "refined" for item in lines),
         "coarse_only_lines": sum(item.get("stage") == "coarse_only" for item in lines),
+        "unresolved_lines": [item["line_id"] + 1 for item in lines if item.get("stage") == "unresolved"],
         "review_lines": [item["line_id"] + 1 for item in lines if item.get("flags")],
         "accuracy_verified": False,
     }
     _write_json(report_path, {"metadata": metadata, "summary": summary, "acoustic_alignment": result,
                               "subtitles": [{"line": i + 1, "source": line.ja, "text": line.zh} for i, line in enumerate(lyrics)]})
     aligned = chinese_items(result, lyrics, helpers.AlignmentItem)
+    if not aligned:
+        raise ValueError(f"所有歌词均未获得可用时间，详情见 {report_path}")
     helpers._step(6, 7, "生成 SRT 和对轴报告")
     helpers.generate_srt(aligned, srt_path)
     print(f"    歌词对齐完成: {summary['refined_lines']}/{len(lyrics)} 行完成精对齐", flush=True)
-    if summary["review_lines"]:
-        print(f"    注意：{len(summary['review_lines'])} 行需要复核，详见对轴报告", flush=True)
+    print(f"    字幕生成：{len(aligned)}/{len(lyrics)} 行", flush=True)
     if no_burn:
         helpers._step(7, 7, "仅生成 SRT")
     else:

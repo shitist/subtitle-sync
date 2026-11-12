@@ -206,7 +206,7 @@ class WorkflowTests(unittest.TestCase):
         def weights(*args):
             events.append("weights")
             return model, Mock(), Mock()
-        def readings(*args):
+        def readings(*args, **kwargs):
             events.append("readings")
             return [[Mock()]], ["ma"]
         with ExitStack() as stack:

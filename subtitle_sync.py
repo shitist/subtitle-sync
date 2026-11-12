@@ -874,10 +874,7 @@ def apply_ocr_timing_assist(
     line_count = len(baseline)
     minimum_anchors = min(line_count, max(3, (line_count + 9) // 10))
     if line_count == 0 or len(anchors) < minimum_anchors:
-        print(
-            f"    OCR 可靠锚点不足（{len(anchors)}/{line_count}），"
-            "保留原有 Whisper 时间轴。"
-        )
+        print(f"    OCR 可靠锚点不足：{len(anchors)}/{line_count}。")
         return baseline
 
     anchor_map = {anchor.line_index: anchor for anchor in anchors}
@@ -886,7 +883,7 @@ def apply_ocr_timing_assist(
         DEFAULT_OCR_SAMPLE_INTERVAL,
     )
     if hard_conflicts:
-        print("    OCR 锚点出现时间倒序，已保留原有 Whisper 时间轴并标记复核。")
+        print("    OCR 锚点时间倒序。")
         return [
             replace(
                 item,
@@ -1136,7 +1133,7 @@ def apply_ocr_timing_assist(
             break
 
     if any(end - start < 0.079 for start, end in zip(starts, ends)):
-        print("    OCR 修正会产生无效字幕区间，已保留原有 Whisper 时间轴。")
+        print("    OCR 修正后出现无效字幕区间。")
         return baseline
 
     corrected = []
@@ -2057,16 +2054,6 @@ def process_single(
         report_step = 7 if ocr_assist else 6
         _step(report_step, total_steps, "生成对轴置信度报告")
         summary = save_alignment_report(aligned, report_path, min_match_score, whisperx_backend=whisperx_backend)
-
-        if (
-            summary["mode"] == "text_dp"
-            and summary["matched_coverage"] < 0.5
-            and not summary["ocr_assisted"]
-        ):
-            print("    ⚠️  文本锚点覆盖率低于 50%，建议先检查 alignment.json 和 SRT。")
-        estimated = sum(item.status == "interpolated" for item in aligned)
-        if estimated:
-            print(f"    注意：{estimated} 行使用估计时间，需人工复核")
 
         if no_burn:
             _step(total_steps, total_steps, "仅生成 SRT，跳过视频烧录")
