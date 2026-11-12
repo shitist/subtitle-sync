@@ -3,8 +3,10 @@ __pycache__/
 *.pyd
 
 .venv/
+.venv-gui/
 .venv-qwen/
 .venv-align/
+.venv-whisperx/
 .runtime/
 .backups/
 .test-runs/
@@ -28,6 +30,7 @@ dist/
 *.srt
 *.alignment.json
 *.whisper.json
+*.speech.json
 *.asr.json
 *.ocr.json
 

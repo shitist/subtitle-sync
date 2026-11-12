@@ -14,10 +14,7 @@ subtitle_sync.py
   5. FFmpeg 将硬字幕烧入原视频
 
 歌词文件格式（UTF-8）:
-  纯中文模式（向后兼容）：
-    世界的终结
-    诞生的光芒
-  中日双语模式（推荐，精度最高）：
+  中日双语模式：
     世界の終わりで|世界的终结
     生まれた光|诞生的光芒
     注：分隔符支持 | 或 Tab
@@ -241,7 +238,7 @@ def transcribe_audio(
     except ImportError:
         _die("未安装 faster-whisper，请运行: pip install faster-whisper")
 
-    print(f"    正在加载 Whisper 模型: {model_name}（首次使用会自动下载）...")
+    print(f"    正在加载 Whisper 模型: {model_name}...")
 
     device, compute_type = _detect_device()
     print(f"    使用设备: {device} / {compute_type}")
@@ -252,7 +249,7 @@ def transcribe_audio(
     transcribe_kwargs = {
         "language": "ja",
         "beam_size": 5,
-        "word_timestamps": True,              # ★ 词级时间戳，边界精度从 ±0.5s → ±0.05s
+        "word_timestamps": True,              # 提供词级时间，供后续歌词定位使用
         "condition_on_previous_text": False,  # ★ 歌曲各行独立，不要用上文"脑补"
         "no_speech_threshold": 0.4,           # 降低无声判定的阈值（歌声可能被误判为无声）
         "compression_ratio_threshold": 2.4,   # 放宽压缩比阈值（音乐场景下容忍度更高）
@@ -1294,6 +1291,7 @@ def _align_with_text(
     min_match_score: float,
     max_span_seconds: Optional[float] = None,
     strict_anchors: bool = False,
+    fill_missing: bool = True,
 ) -> list[AlignmentItem]:
     """按歌词顺序将每行日文匹配到连续的 Whisper word span。"""
     line_count = len(lyric_lines)
@@ -1443,6 +1441,9 @@ def _align_with_text(
         )
 
     print(f"    文本锚点: {len(anchored)}/{line_count} 行（阈值 {anchor_threshold:.0f}）")
+    if not fill_missing:
+        return [anchored.get(index) or AlignmentItem(None, None, line.zh, source_text=line.ja, status="unresolved")
+                for index, line in enumerate(lyric_lines)]
     return _fill_unmatched_lines(lyric_lines, anchored, words[0].start, words[-1].end)
 
 
@@ -1664,12 +1665,13 @@ def save_alignment_report(
     output_path: Path,
     min_match_score: float,
     strict_anchors: bool = False,
+    whisperx_backend: dict | None = None,
 ) -> dict:
     """保存逐行匹配依据与置信度，返回摘要。"""
     matched = [
         item
         for item in aligned
-        if item.status in {"matched", "low_confidence", "latin_anchor"}
+        if item.status in {"matched", "low_confidence", "latin_anchor", "whisperx", "asr_anchor"}
     ]
     scores = [item.score for item in matched if item.score is not None]
     word_probabilities = [
@@ -1679,7 +1681,9 @@ def save_alignment_report(
     ]
     ocr_anchors = [item for item in aligned if item.ocr_score is not None]
     ocr_scores = [item.ocr_score for item in ocr_anchors if item.ocr_score is not None]
-    if any(item.status == "latin_anchor" for item in aligned):
+    if whisperx_backend is not None:
+        mode = "whisperx"
+    elif any(item.status == "latin_anchor" for item in aligned):
         mode = "latin_anchor"
     elif any(item.source_text for item in aligned):
         mode = "text_dp"
@@ -1715,7 +1719,7 @@ def save_alignment_report(
         "needs_review": [
             index
             for index, item in enumerate(aligned, 1)
-            if item.status != "matched" or item.review_reason
+            if item.status not in {"matched", "whisperx"} or item.review_reason
         ],
         "review_reasons": {
             str(index): item.review_reason
@@ -1731,11 +1735,19 @@ def save_alignment_report(
             for index, item in enumerate(aligned, 1)
         ],
     }
+    if whisperx_backend is not None:
+        payload["whisperx"] = whisperx_backend
+        summary["whisperx_lines"] = whisperx_backend["aligned_lines"]
+        summary["asr_anchor_lines"] = whisperx_backend["asr_anchor_lines"]
+        summary["unresolved_lines"] = whisperx_backend["unresolved_lines"]
     with open(output_path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
 
     print(f"    对轴报告已生成: {output_path}")
-    if mode in {"text_dp", "latin_anchor"}:
+    if mode == "whisperx":
+        print(f"    WhisperX 歌词对齐: {summary['whisperx_lines']}/{len(aligned)} 行，"
+              f"ASR 锚点 {summary['asr_anchor_lines']} 行，未定位 {len(summary['unresolved_lines'])} 行")
+    elif mode in {"text_dp", "latin_anchor"}:
         label = "文本匹配" if mode == "text_dp" else "英文锚点"
         print(
             f"    {label}覆盖率: {summary['matched_coverage'] * 100:.1f}%"
@@ -1955,7 +1967,8 @@ def process_single(
         tmpdir = Path(_tmpdir)
 
         _step(1, total_steps, "加载歌词")
-        _ja_prompt, lyric_lines = load_lyrics(lyrics_path)
+        _ja_prompt, lyric_lines = load_lyrics(lyrics_path, require_pairs=True)
+        from mv_whisperx import align_lyrics as align_mv, metadata as mv_metadata, load_cache as load_mv_cache
         cache_path = output_path.with_suffix(".whisper.json")
         metadata = _transcript_metadata(
             video_path,
@@ -1964,7 +1977,11 @@ def process_single(
             model_name=model_name,
         )
         segments = None if refresh_transcript else load_transcript_cache(cache_path, metadata)
-        if segments is None:
+        report_path = output_path.with_suffix(".alignment.json")
+        alignment_metadata = mv_metadata(metadata, lyric_lines)
+        cached_alignment = None if refresh_transcript else load_mv_cache(report_path, alignment_metadata, lyric_lines,
+                                                                        sys.modules[__name__])
+        if segments is None or cached_alignment is None:
             _step(2, total_steps, "提取音频")
             audio_wav = tmpdir / "audio.wav"
             extract_audio(video_path, audio_wav)
@@ -1976,6 +1993,11 @@ def process_single(
                 _step(3, total_steps, "使用原始混合音频（跳过 Demucs）")
                 transcription_audio = audio_wav
 
+        else:
+            _step(2, total_steps, "复用 WhisperX 歌词对齐缓存，跳过音频提取")
+            _step(3, total_steps, "复用 WhisperX 歌词对齐缓存，跳过人声分离")
+
+        if segments is None:
             _step(4, total_steps, f"{model_label(model_name)} 日语识别")
             segments = transcribe_audio(
                 transcription_audio,
@@ -1984,16 +2006,24 @@ def process_single(
             )
             save_transcript_cache(cache_path, segments, metadata)
         else:
-            _step(2, total_steps, "复用转录缓存，跳过音频提取")
-            _step(3, total_steps, "复用转录缓存，跳过人声分离")
             _step(4, total_steps, "复用转录缓存，跳过识别")
 
-        _step(5, total_steps, "文本驱动时间轴映射")
-        aligned = align_lyrics_to_segments(
-            segments,
-            lyric_lines,
-            min_match_score=min_match_score,
-        )
+        _step(5, total_steps, "WhisperX 日文歌词声学对齐")
+        if cached_alignment is not None:
+            aligned, whisperx_backend = cached_alignment
+            print("    复用 WhisperX 歌词对齐缓存")
+        else:
+            alignment_audio = tmpdir / "alignment.wav"
+            _run([_get_ffmpeg_path(), "-y", "-i", str(transcription_audio), "-ar", "16000", "-ac", "1",
+                  str(alignment_audio)], "准备 WhisperX 对齐音频")
+            aligned, whisperx_backend = align_mv(alignment_audio, segments, lyric_lines, min_match_score,
+                                                sys.modules[__name__])
+            whisperx_backend["metadata"] = alignment_metadata
+            whisperx_backend["items"] = [asdict(item) for item in aligned]
+        if whisperx_backend["unresolved_lines"]:
+            save_alignment_report(aligned, report_path, min_match_score, whisperx_backend=whisperx_backend)
+            missing = ", ".join(map(str, whisperx_backend["unresolved_lines"]))
+            raise RuntimeError(f"WhisperX 未定位到歌词第 {missing} 行，详情见 {report_path}")
 
         ocr_cache_path = None
         if ocr_assist:
@@ -2026,8 +2056,7 @@ def process_single(
 
         report_step = 7 if ocr_assist else 6
         _step(report_step, total_steps, "生成对轴置信度报告")
-        report_path = output_path.with_suffix(".alignment.json")
-        summary = save_alignment_report(aligned, report_path, min_match_score)
+        summary = save_alignment_report(aligned, report_path, min_match_score, whisperx_backend=whisperx_backend)
 
         if (
             summary["mode"] == "text_dp"
@@ -2213,15 +2242,15 @@ def _step(current: int, total: int, label: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="subtitle_sync",
-        description="日语歌曲中文字幕自动对轴工具 v2.0",
+        description="MV 歌词打轴与视频自动字幕工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  # 单文件处理（纯中文歌词）
+  # MV 歌词打轴（中日双语歌词）
   py subtitle_sync.py --video song.mp4 --lyrics song.txt
 
-  # 单文件处理（中日双语歌词，推荐！精度最高）
-  py subtitle_sync.py --video song.mp4 --lyrics song_bilingual.txt
+  # 视频自动字幕（无需歌词）
+  py subtitle_sync.py --task speech --video clip.mp4 --language auto
 
   # 指定输出
   py subtitle_sync.py --video song.mp4 --lyrics song.txt --output out.mp4
@@ -2231,15 +2260,18 @@ def main() -> None:
   py subtitle_sync.py --batch --video-dir ./videos --lyrics-dir ./lyrics --output-dir ./output
 
 歌词文件格式:
-  纯中文（向后兼容）：  每行一句中文
-  中日双语（推荐）：    日文|中文  或  日文<Tab>中文
+  整块格式：中文歌词在前、日文原词在后，两块行数一致
+  逐行格式：日文|中文  或  日文<Tab>中文
         """,
     )
 
     # ── 单文件模式 ────────────────────────────────────────────────
     parser.add_argument("--video",   help="输入视频文件路径")
-    parser.add_argument("--lyrics",  help="歌词文本文件（UTF-8，支持纯中文或日文|中文双语格式）")
+    parser.add_argument("--lyrics",  help="中日双语歌词文本（UTF-8，支持整块或日文|中文逐行格式）")
     parser.add_argument("--output",  help="输出视频路径（默认: 原文件名_subtitled + 原扩展名）")
+    parser.add_argument("--task", choices=("lyrics", "speech"), default="lyrics",
+                        help="lyrics：歌词打轴；speech：视频自动字幕（WhisperX）")
+    parser.add_argument("--language", default="auto", help="视频自动字幕识别语言：auto 或语言代码（如 ja/en/zh）")
     parser.add_argument("--no-vad",  action="store_true", help="禁用 VAD 静音过滤（不推荐）")
     parser.add_argument("--no-burn", action="store_true", help="只生成 SRT/报告，不烧录视频")
     parser.add_argument("--subtitle-font", choices=tuple(FONT_PRESETS), default=DEFAULT_FONT,
@@ -2294,6 +2326,28 @@ def main() -> None:
         parser.error(str(error))
     if not 0 <= args.min_match_score <= 100:
         parser.error("--min-match-score 必须在 0 到 100 之间")
+
+    if args.task == "speech":
+        from speech_catalog import LANGUAGE_CODES
+        from speech_subtitles import process_video, process_batch as process_speech_batch
+        if args.model not in SUPPORTED_WHISPER_MODELS:
+            parser.error("视频自动字幕请选择 Whisper 模型")
+        if args.language not in ("auto", *LANGUAGE_CODES):
+            parser.error("--language 需要填写 auto 或 Whisper 语言代码")
+        if args.ocr_assist:
+            parser.error("视频自动字幕不使用画面歌词辅助")
+        options = dict(helpers=sys.modules[__name__], model_name=args.model, language=args.language,
+                       no_vad=args.no_vad, no_burn=args.no_burn, refresh=args.refresh_transcript,
+                       subtitle_font=args.subtitle_font, subtitle_size=args.subtitle_size)
+        if args.batch:
+            if not args.video_dir:
+                parser.error("批量模式需要指定 --video-dir")
+            process_speech_batch(Path(args.video_dir), Path(args.output_dir) if args.output_dir else None, **options)
+        else:
+            if not args.video:
+                parser.error("单文件模式需要指定 --video")
+            process_video(Path(args.video), Path(args.output) if args.output else None, **options)
+        return
 
     if args.batch:
         if not args.video_dir or not args.lyrics_dir:

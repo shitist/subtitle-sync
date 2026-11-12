@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from asr_models import LYRIC_MODEL
 from subtitle_style import DEFAULT_FONT, FONT_PRESETS
+from speech_catalog import ALIGN_MODELS, LANGUAGE_CODES, LANGUAGE_NAMES
 
 from PySide6.QtCore import QObject, QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont, QFontDatabase, QPalette
@@ -35,7 +36,6 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
-    QSizePolicy,
     QSplitter,
     QStyleFactory,
     QTabWidget,
@@ -84,39 +84,41 @@ PYTHON_MODULES = (
     "safetensors",
     "g2pflow", "fugashi", "unidic", "numba", "scipy", "soundfile",
     "omegaconf", "pydantic", "einops", "loguru",
+    "whisperx", "torchaudio", "pandas", "nltk",
 )
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".m4v"}
 LYRIC_EXTENSIONS = {".txt", ".lrc"}
 STAGE_PROGRESS = {
+    5: {1: 5, 2: 15, 3: 65, 4: 90, 5: 95},
     7: {1: 5, 2: 14, 3: 24, 4: 38, 5: 78, 6: 88, 7: 95},
     8: {1: 5, 2: 14, 3: 24, 4: 38, 5: 48, 6: 55, 7: 88, 8: 95},
 }
 MODEL_OPTIONS = (
     {
-        "id": "large-v3",
-        "label": "Large v3 — 日语歌曲、复杂音频（默认）",
-        "description": "日语歌曲、现场或背景声复杂的视频；精度优先，处理时间较长。",
+        "id": LYRIC_MODEL,
+        "label": "歌词声学对齐（推荐）",
+        "description": "MMS+TIFA路线：轻量准确，推荐使用。",
     },
     {
-        "id": LYRIC_MODEL,
-        "label": "歌词声学对齐 — 中日双语 MV（试验）",
-        "description": "按日文原词定位并生成中文轴；使用 MMS + TIFA，保留整曲音频。需要行数一致的中日歌词。",
+        "id": "large-v3",
+        "label": "Large v3 — 日语歌曲、复杂音频",
+        "description": "WhisperX 路线：识别后用日文原词声学对齐，再映射中文字幕。精度优先。",
     },
     {
         "id": "large-v3-turbo",
         "label": "Large v3 Turbo — 访谈、解说、一般视频",
-        "description": "访谈、解说和一般视频；接近 Large v3，处理速度更快。",
+        "description": "WhisperX 路线：识别后用日文原词声学对齐。处理速度更快。",
     },
     {
         "id": "medium",
         "label": "Medium — 清晰语音、低配置",
-        "description": "语音较清晰或硬件资源有限的视频；速度与精度折中。",
+        "description": "WhisperX 路线：识别后用日文原词声学对齐。速度与精度折中。",
     },
     {
         "id": "small",
         "label": "Small — 快速草稿、CPU",
-        "description": "清晰单人语音、快速草稿或 CPU；不建议用于歌曲和嘈杂音频。",
+        "description": "WhisperX 路线：识别后用日文原词声学对齐。识别模型较小。",
     },
 )
 
@@ -174,6 +176,9 @@ messagebox = _MessageBoxAdapter()
 
 
 def _required_modules(config: dict) -> set[str]:
+    if config.get("task") == "speech":
+        return {"whisperx", "faster_whisper", "torch", "torchaudio", "transformers",
+                "pandas", "nltk", "soundfile", "imageio_ffmpeg"}
     if config.get("model") == LYRIC_MODEL:
         required = {
             "torch", "transformers", "g2pflow", "fugashi", "unidic", "numba",
@@ -183,7 +188,8 @@ def _required_modules(config: dict) -> set[str]:
         if config["audio_source"] == "vocals":
             required.add("demucs")
         return required
-    required = {"faster_whisper", "rapidfuzz", "imageio_ffmpeg"}
+    required = {"whisperx", "faster_whisper", "torch", "torchaudio", "transformers",
+                "pandas", "nltk", "soundfile", "rapidfuzz", "imageio_ffmpeg"}
     if config["audio_source"] == "vocals":
         required.add("demucs")
     if config.get("ocr_assist"):
@@ -195,7 +201,7 @@ def _creation_flags() -> int:
     return subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
-def _candidate_pythons(include_align: bool = False) -> list[tuple[str, str, int]]:
+def _candidate_pythons(include_align: bool = False, include_speech: bool = False) -> list[tuple[str, str, int]]:
     """列出候选解释器；返回 (路径, 来源, 优先级)。"""
     candidates: list[tuple[str, str, int]] = []
     override = os.environ.get("SUBTITLE_SYNC_PYTHON", "").strip()
@@ -206,6 +212,9 @@ def _candidate_pythons(include_align: bool = False) -> list[tuple[str, str, int]
     if EXE_DIR.name.lower() in {"release", "dist"}:
         project_roots.append(EXE_DIR.parent)
     for root in project_roots:
+        if include_speech:
+            executable = root / ".venv-whisperx" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+            candidates.append((str(executable), "视频字幕专用环境", 97))
         if include_align:
             align_executable = root / ".venv-align" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
             candidates.append((str(align_executable), "歌词对齐专用环境", 96))
@@ -305,8 +314,8 @@ def _choose_python(probes: list[dict], required_modules: set[str]) -> dict | Non
     return max(usable, default=None, key=lambda item: item[:3])[3] if usable else None
 
 
-def _requirements_path(align: bool = False) -> Path:
-    filename = "requirements-align.txt" if align else "requirements.txt"
+def _requirements_path(align: bool = False, speech: bool = False) -> Path:
+    filename = "requirements-speech.txt" if speech else "requirements-align.txt" if align else "requirements.txt"
     candidates = [APP_DIR / filename, EXE_DIR.parent / filename]
     if hasattr(sys, "_MEIPASS"):
         candidates.append(Path(sys._MEIPASS) / filename)
@@ -319,6 +328,7 @@ def _find_python(required_modules: set[str]) -> tuple[dict, list[dict]]:
         _probe_python(path, source, priority)
         for path, source, priority in _candidate_pythons(
             include_align="g2pflow" in required_modules,
+            include_speech="whisperx" in required_modules,
         )
     ]
     selected = _choose_python(probes, required_modules)
@@ -336,7 +346,7 @@ def _find_python(required_modules: set[str]) -> tuple[dict, list[dict]]:
         checked.append(
             f"- {probe['path']}（Python {version}，缺少: {', '.join(missing) or '无'}）"
         )
-    requirements = _requirements_path(align="g2pflow" in required_modules)
+    requirements = _requirements_path(align="g2pflow" in required_modules, speech="whisperx" in required_modules)
     best_path = probes[0]["path"] if probes else "python"
     raise RuntimeError(
         "没有找到可用的 Python 环境。\n\n"
@@ -408,6 +418,19 @@ def parse_runtime_line(raw_line: str) -> dict | None:
             "progress": low + round(int(current) / max(1, int(total)) * (high - low)),
         }
 
+    speech_progress = re.match(r"^视频字幕进度:\s*(\S+)\s+(\d+)/(\d+)$", line)
+    if speech_progress:
+        phase, current, total = speech_progress.groups()
+        low, high = (15, 64) if phase == "识别语音" else (65, 89)
+        return {"kind": "speech_progress", "phase": phase, "count": int(current), "total": int(total),
+                "progress": low + round(int(current) / max(1, int(total)) * (high - low))}
+
+    mv_progress = re.match(r"^MV 对齐进度:\s*(\d+)/(\d+)$", line)
+    if mv_progress:
+        current, total = map(int, mv_progress.groups())
+        return {"kind": "lyric_progress", "phase": "WhisperX 歌词对齐", "count": current, "total": total,
+                "progress": 50 + round(current / max(1, total) * 27)}
+
     segment_match = re.match(r"^\[(\d{3})\]\s+\d+(?:\.\d+)?s\s*[→-]", line)
     if segment_match:
         return {"kind": "recognition", "count": int(segment_match.group(1))}
@@ -441,6 +464,10 @@ def parse_runtime_line(raw_line: str) -> dict | None:
 
     useful_prefixes = (
         "检测到",
+        "对齐模型:",
+        "复用视频字幕缓存",
+        "复用 WhisperX 歌词对齐缓存",
+        "WhisperX 歌词对齐:",
         "复用 Whisper",
         "复用转录",
         "已有转录",
@@ -495,24 +522,25 @@ def parse_runtime_line(raw_line: str) -> dict | None:
 def _build_processing_command(python_exe: str, config: dict) -> list[str]:
     """根据界面中有限的选项构建核心脚本命令。"""
     command = [python_exe, "-u", str(SYNC_SCRIPT)]
+    speech = config.get("task") == "speech"
+    if speech:
+        command += ["--task", "speech", "--language", config.get("language", "auto")]
     if config["mode"] == "single":
-        command += ["--video", config["video"], "--lyrics", config["lyrics"]]
+        command += ["--video", config["video"]]
+        if not speech:
+            command += ["--lyrics", config["lyrics"]]
         if config.get("output"):
             command += ["--output", config["output"]]
     else:
-        command += [
-            "--batch",
-            "--video-dir",
-            config["video_dir"],
-            "--lyrics-dir",
-            config["lyrics_dir"],
-        ]
+        command += ["--batch", "--video-dir", config["video_dir"]]
+        if not speech:
+            command += ["--lyrics-dir", config["lyrics_dir"]]
         if config.get("output_dir"):
             command += ["--output-dir", config["output_dir"]]
 
     command += [
         "--audio-source",
-        config["audio_source"],
+        "original" if speech else config["audio_source"],
         "--model",
         config["model"],
     ]
@@ -526,7 +554,7 @@ def _build_processing_command(python_exe: str, config: dict) -> list[str]:
                     str(config.get("subtitle_size", FONT_PRESETS[font]["size"]))]
     if config.get("refresh"):
         command.append("--refresh-transcript")
-    if config.get("ocr_assist") and config["model"] != LYRIC_MODEL:
+    if config.get("ocr_assist") and config["model"] != LYRIC_MODEL and not speech:
         command.append("--ocr-assist")
         if config.get("refresh"):
             command.append("--refresh-ocr")
@@ -566,52 +594,6 @@ class PathLineEdit(QLineEdit):
             super().dropEvent(event)
 
 
-class DropArea(QFrame):
-    filesDropped = Signal(list)
-
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setObjectName("dropArea")
-        self.setProperty("dragActive", False)
-        self.setAcceptDrops(True)
-        self.setMinimumHeight(82)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 13, 16, 13)
-        layout.setSpacing(3)
-        title = QLabel("将视频和歌词拖到这里")
-        title.setObjectName("dropTitle")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        note = QLabel("也可以在下方分别选择文件")
-        note.setObjectName("mutedLabel")
-        note.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(title)
-        layout.addWidget(note)
-
-    def _set_drag_active(self, active: bool) -> None:
-        self.setProperty("dragActive", active)
-        self.style().unpolish(self)
-        self.style().polish(self)
-
-    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if event.mimeData().hasUrls():
-            self._set_drag_active(True)
-            event.acceptProposedAction()
-        else:
-            super().dragEnterEvent(event)
-
-    def dragLeaveEvent(self, event) -> None:
-        self._set_drag_active(False)
-        super().dragLeaveEvent(event)
-
-    def dropEvent(self, event: QDropEvent) -> None:
-        self._set_drag_active(False)
-        paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
-        if paths:
-            self.filesDropped.emit(paths)
-            event.acceptProposedAction()
-
-
 class AppSignals(QObject):
     output = Signal(str)
     status = Signal(str, str)
@@ -631,6 +613,8 @@ class App(QMainWindow):
         self._theme_mode = "system"
         self._colors = THEMES["light"]
         self._settings = QSettings("SubtitleSync", "SubtitleSync")
+        self._active_task = None
+        self._task_states = {}
         self._signals = AppSignals()
         self._signals.output.connect(self._receive_process_output)
         self._signals.status.connect(self._apply_status)
@@ -638,6 +622,9 @@ class App(QMainWindow):
         self._signals.runningChanged.connect(self._apply_running_state)
 
         self._build_ui()
+        saved_task = self._settings.value("processing/task", "lyrics")
+        self.task_combo.setCurrentIndex(max(0, self.task_combo.findData(saved_task)))
+        self._task_changed()
 
         self._elapsed_timer = QTimer(self)
         self._elapsed_timer.setInterval(1000)
@@ -671,7 +658,7 @@ class App(QMainWindow):
         title_box.setSpacing(1)
         title = QLabel("字幕对轴")
         title.setObjectName("appTitle")
-        subtitle = QLabel("日语歌曲中文字幕时间轴")
+        subtitle = QLabel("视频自动字幕 · MV 歌词打轴")
         subtitle.setObjectName("mutedLabel")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
@@ -707,6 +694,14 @@ class App(QMainWindow):
         form_layout.setContentsMargins(24, 18, 24, 16)
         form_layout.setSpacing(14)
         form_scroll.setWidget(form_content)
+
+        task_row = QHBoxLayout()
+        task_row.addWidget(QLabel("处理模式"))
+        self.task_combo = QComboBox()
+        self.task_combo.addItem("MV 歌词打轴", "lyrics")
+        self.task_combo.addItem("视频自动字幕", "speech")
+        task_row.addWidget(self.task_combo, 1)
+        form_layout.addLayout(task_row)
 
         self.mode_tabs = QTabWidget()
         self.mode_tabs.setDocumentMode(True)
@@ -758,6 +753,7 @@ class App(QMainWindow):
         action_row.addWidget(self.start_btn)
         footer_layout.addLayout(action_row)
         root.addWidget(footer)
+        self.task_combo.currentIndexChanged.connect(self._task_changed)
 
     def _build_single_page(self) -> QWidget:
         page = QWidget()
@@ -767,12 +763,6 @@ class App(QMainWindow):
 
         file_row = QHBoxLayout()
         file_row.setSpacing(11)
-        drop_area = DropArea()
-        drop_area.filesDropped.connect(self._on_files_dropped)
-        drop_area.setMinimumWidth(205)
-        drop_area.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
-        file_row.addWidget(drop_area, 1)
-
         card = QFrame()
         card.setObjectName("card")
         grid = QGridLayout(card)
@@ -782,15 +772,15 @@ class App(QMainWindow):
         grid.setColumnStretch(1, 1)
 
         self.video_edit = PathLineEdit()
-        self.video_edit.setPlaceholderText("选择视频文件")
+        self.video_edit.setPlaceholderText("选择或拖入视频文件")
         self.video_edit.pathDropped.connect(lambda value: self._on_video_selected(Path(value)))
         self.lyrics_edit = PathLineEdit()
-        self.lyrics_edit.setPlaceholderText("选择 UTF-8 歌词文本")
+        self.lyrics_edit.setPlaceholderText("选择或拖入 UTF-8 歌词文本")
         self.output_edit = PathLineEdit()
         self.output_edit.setPlaceholderText("不填写时自动命名")
 
         self._add_path_row(grid, 0, "视频", self.video_edit, self._browse_video)
-        self._add_path_row(grid, 1, "歌词", self.lyrics_edit, self._browse_lyrics)
+        self.lyrics_row = self._add_path_row(grid, 1, "歌词", self.lyrics_edit, self._browse_lyrics)
         self._add_path_row(grid, 2, "输出", self.output_edit, self._browse_output)
         file_row.addWidget(card, 3)
         layout.addLayout(file_row)
@@ -800,12 +790,7 @@ class App(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 10, 0, 4)
-        layout.setSpacing(10)
-
-        note = QLabel("视频与歌词按文件名对应。目录也可以直接拖入输入框。")
-        note.setObjectName("mutedLabel")
-        note.setWordWrap(True)
-        layout.addWidget(note)
+        layout.setSpacing(11)
 
         card = QFrame()
         card.setObjectName("card")
@@ -816,20 +801,19 @@ class App(QMainWindow):
         grid.setColumnStretch(1, 1)
 
         self.video_dir_edit = PathLineEdit(directories=True)
-        self.video_dir_edit.setPlaceholderText("包含视频的目录")
+        self.video_dir_edit.setPlaceholderText("选择或拖入视频目录")
         self.lyrics_dir_edit = PathLineEdit(directories=True)
-        self.lyrics_dir_edit.setPlaceholderText("包含歌词的目录")
+        self.lyrics_dir_edit.setPlaceholderText("选择或拖入 UTF-8 歌词文本目录")
         self.output_dir_edit = PathLineEdit(directories=True)
-        self.output_dir_edit.setPlaceholderText("不填写时使用视频目录下的 output")
+        self.output_dir_edit.setPlaceholderText(self.output_edit.placeholderText())
 
-        self._add_path_row(grid, 0, "视频目录", self.video_dir_edit, lambda: self._browse_dir(self.video_dir_edit))
-        self._add_path_row(grid, 1, "歌词目录", self.lyrics_dir_edit, lambda: self._browse_dir(self.lyrics_dir_edit))
-        self._add_path_row(grid, 2, "输出目录", self.output_dir_edit, lambda: self._browse_dir(self.output_dir_edit))
+        self._add_path_row(grid, 0, "视频", self.video_dir_edit, lambda: self._browse_dir(self.video_dir_edit))
+        self.lyrics_dir_row = self._add_path_row(grid, 1, "歌词", self.lyrics_dir_edit, lambda: self._browse_dir(self.lyrics_dir_edit))
+        self._add_path_row(grid, 2, "输出", self.output_dir_edit, lambda: self._browse_dir(self.output_dir_edit))
         layout.addWidget(card)
-        layout.addStretch()
         return page
 
-    def _add_path_row(self, grid: QGridLayout, row: int, label: str, edit: QLineEdit, callback) -> None:
+    def _add_path_row(self, grid: QGridLayout, row: int, label: str, edit: QLineEdit, callback) -> tuple:
         label_widget = QLabel(label)
         label_widget.setObjectName("fieldLabel")
         label_widget.setMinimumWidth(64)
@@ -840,11 +824,12 @@ class App(QMainWindow):
         grid.addWidget(label_widget, row, 0)
         grid.addWidget(edit, row, 1)
         grid.addWidget(button, row, 2)
+        return label_widget, edit, button
 
     def _build_options_card(self) -> QWidget:
         card = QFrame()
         card.setObjectName("card")
-        grid = QGridLayout(card)
+        grid = self.options_grid = QGridLayout(card)
         grid.setContentsMargins(16, 13, 16, 13)
         grid.setHorizontalSpacing(14)
         grid.setVerticalSpacing(9)
@@ -853,7 +838,7 @@ class App(QMainWindow):
         heading.setObjectName("sectionTitle")
         grid.addWidget(heading, 0, 0, 1, 4)
 
-        model_label = QLabel("打轴方式")
+        model_label = self.model_field_label = QLabel("打轴方式")
         model_label.setObjectName("fieldLabel")
         self.model_combo = QComboBox()
         for index, option in enumerate(MODEL_OPTIONS):
@@ -863,7 +848,6 @@ class App(QMainWindow):
                 option["description"],
                 Qt.ItemDataRole.ToolTipRole,
             )
-        self.model_combo.setToolTip("首次使用所选模型时会自动下载，之后从本机缓存加载。")
         self.model_description = QLabel()
         self.model_description.setObjectName("mutedLabel")
         self.model_description.setWordWrap(True)
@@ -873,7 +857,7 @@ class App(QMainWindow):
         grid.addWidget(self.model_combo, 1, 1, 1, 3)
         grid.addWidget(self.model_description, 2, 1, 1, 3)
 
-        source_label = QLabel("识别音源")
+        source_label = self.source_field_label = QLabel("识别音源")
         source_label.setObjectName("fieldLabel")
         self.audio_source_combo = QComboBox()
         self.audio_source_combo.addItem("分离人声（较慢）", "vocals")
@@ -896,10 +880,14 @@ class App(QMainWindow):
         )
         self.no_vad_cb = QCheckBox("禁用 VAD")
         self.no_vad_cb.setToolTip("保留所有音频区间。通常无需开启。")
-        grid.addWidget(self.no_burn_cb, 3, 2)
-        grid.addWidget(self.refresh_cb, 3, 3)
-        grid.addWidget(self.ocr_assist_cb, 4, 1)
-        grid.addWidget(self.no_vad_cb, 4, 2)
+        self.option_checks = QWidget()
+        checks_layout = QHBoxLayout(self.option_checks)
+        checks_layout.setContentsMargins(0, 0, 0, 0)
+        checks_layout.setSpacing(18)
+        for checkbox in (self.no_vad_cb, self.ocr_assist_cb, self.no_burn_cb, self.refresh_cb):
+            checks_layout.addWidget(checkbox)
+        checks_layout.addStretch()
+        grid.addWidget(self.option_checks, 4, 1, 1, 3)
 
         self.subtitle_font_combo = QComboBox()
         installed = set(QFontDatabase.families())
@@ -916,10 +904,21 @@ class App(QMainWindow):
         default_size = FONT_PRESETS[self.subtitle_font_combo.currentData()]["size"]
         self.subtitle_size_spin.setValue(float(self._settings.value("subtitles/size", default_size)))
         self.subtitle_size_spin.setToolTip("ASS 相对字号，与 FFmpeg 工具箱一致。")
-        grid.addWidget(QLabel("字幕字体"), 5, 0)
+        self.font_field_label = QLabel("字幕字体")
+        self.size_field_label = QLabel("字号")
+        grid.addWidget(self.font_field_label, 5, 0)
         grid.addWidget(self.subtitle_font_combo, 5, 1)
-        grid.addWidget(QLabel("字号"), 5, 2)
+        grid.addWidget(self.size_field_label, 5, 2)
         grid.addWidget(self.subtitle_size_spin, 5, 3)
+        self.language_label = QLabel("识别语言")
+        self.language_combo = QComboBox()
+        self.language_combo.addItem("自动检测", "auto")
+        preferred = ["zh", "ja", "en", "ko", "yue"]
+        for code in preferred + [c for c in LANGUAGE_CODES if c not in preferred]:
+            self.language_combo.addItem(f"{LANGUAGE_NAMES.get(code, code)} · {code}", code)
+        self.language_combo.currentIndexChanged.connect(self._update_language_hint)
+        grid.addWidget(self.language_label, 6, 0)
+        grid.addWidget(self.language_combo, 6, 1, 1, 3)
         self.subtitle_font_combo.currentIndexChanged.connect(self._subtitle_font_changed)
         self.subtitle_size_spin.valueChanged.connect(self._remember_subtitle_style)
         self.no_burn_cb.toggled.connect(self._update_subtitle_controls)
@@ -946,20 +945,89 @@ class App(QMainWindow):
             return
         model_id = self.model_combo.currentData()
         option = next(item for item in MODEL_OPTIONS if item["id"] == model_id)
-        self.model_description.setText(
-            option["description"] + " 首次使用会自动下载并缓存。"
-        )
+        description = option["description"]
+        if hasattr(self, "task_combo") and self.task_combo.currentData() == "speech":
+            description = {"large-v3": "识别准确度优先。", "large-v3-turbo": "处理更快，适合一般视频。",
+                           "medium": "速度与准确度折中。", "small": "资源占用较低，适合清晰语音。"}[model_id]
+        self.model_description.setText(description)
         self._update_engine_controls()
 
     def _update_engine_controls(self) -> None:
         if not hasattr(self, "no_vad_cb"):
             return
         acoustic = self.model_combo.currentData() == LYRIC_MODEL
+        speech = self.task_combo.currentData() == "speech"
         self.no_vad_cb.setEnabled(not self.running and not acoustic)
-        self.ocr_assist_cb.setEnabled(not self.running and not acoustic)
+        self.ocr_assist_cb.setEnabled(not self.running and not acoustic and not speech)
+        self.ocr_assist_cb.setVisible(not speech)
+        self.no_vad_cb.setText("启用 VAD" if speech else "禁用 VAD")
         self.refresh_cb.setText("重新对齐" if acoustic else "重新识别")
         self.no_vad_cb.setToolTip("歌词声学对齐始终保留整曲音频，不使用 VAD 裁切。" if acoustic else "保留所有音频区间。")
         self.ocr_assist_cb.setToolTip("歌词声学对齐使用音频与日文原词。" if acoustic else "用画面中已有的歌词校正局部漂移。")
+
+    def _update_language_hint(self) -> None:
+        language = self.language_combo.currentData()
+        self.language_combo.setToolTip(
+            "该语言使用 Whisper 原生词级时间。" if language != "auto" and language not in ALIGN_MODELS
+            else "选择视频中的主要语言，或使用自动检测。"
+        )
+
+    def _task_changed(self) -> None:
+        task = self.task_combo.currentData()
+        if self._active_task == task:
+            return
+        if self._active_task is not None:
+            state = {"model": self.model_combo.currentData(), "audio_source": self.audio_source_combo.currentData(),
+                     "vad_checked": self.no_vad_cb.isChecked(), "language": self.language_combo.currentData()}
+            self._task_states[self._active_task] = state
+            self._settings.setValue(f"processing/{self._active_task}", state)
+        speech = task == "speech"
+        state = self._task_states.get(task) or self._settings.value(f"processing/{task}", {}) or {}
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        for option in MODEL_OPTIONS:
+            if speech and option["id"] == LYRIC_MODEL:
+                continue
+            name = option["label"].split(" — ")[0]
+            label = name if speech else option["label"] if option["id"] == LYRIC_MODEL else f"WhisperX · {name}"
+            self.model_combo.addItem(label, option["id"])
+        desired = state.get("model", "large-v3" if speech else LYRIC_MODEL)
+        self.model_combo.setCurrentIndex(max(0, self.model_combo.findData(desired)))
+        self.model_combo.blockSignals(False)
+        source = state.get("audio_source", "original" if speech else "vocals")
+        self.audio_source_combo.setCurrentIndex(max(0, self.audio_source_combo.findData(source)))
+        self.no_vad_cb.setChecked(state.get("vad_checked", speech))
+        self.language_combo.setCurrentIndex(max(0, self.language_combo.findData(state.get("language", "auto"))))
+        for widget in (*self.lyrics_row, *self.lyrics_dir_row, self.source_field_label, self.audio_source_combo):
+            widget.setVisible(not speech)
+        for widget in (self.language_label, self.language_combo):
+            widget.setVisible(speech)
+        # Reuse the same controls while keeping each mode's field order compact.
+        placements = (
+            (self.language_label, 3 if speech else 6, 0, 1),
+            (self.language_combo, 3 if speech else 6, 1, 3),
+            (self.option_checks, 4, 1, 3),
+            (self.font_field_label, 5, 0, 1),
+            (self.subtitle_font_combo, 5, 1, 1),
+            (self.size_field_label, 5, 2, 1),
+            (self.subtitle_size_spin, 5, 3, 1),
+        )
+        for widget, row, column, span in placements:
+            self.options_grid.removeWidget(widget)
+            self.options_grid.addWidget(widget, row, column, 1, span)
+        self.model_field_label.setText("识别模型" if speech else "打轴方式")
+        self._active_task = task
+        self._settings.setValue("processing/task", task)
+        self._update_model_description()
+        self._update_language_hint()
+
+    def closeEvent(self, event) -> None:
+        task = self.task_combo.currentData()
+        self._settings.setValue(f"processing/{task}", {
+            "model": self.model_combo.currentData(), "audio_source": self.audio_source_combo.currentData(),
+            "vad_checked": self.no_vad_cb.isChecked(), "language": self.language_combo.currentData(),
+        })
+        super().closeEvent(event)
 
     def _build_log_panel(self) -> QWidget:
         panel = QFrame()
@@ -1207,14 +1275,17 @@ class App(QMainWindow):
             return
 
         mode = "single" if self.mode_tabs.currentIndex() == 0 else "batch"
+        speech = self.task_combo.currentData() == "speech"
         config = {
             "mode": mode,
-            "audio_source": self.audio_source_combo.currentData(),
+            "task": self.task_combo.currentData(),
+            "language": self.language_combo.currentData(),
+            "audio_source": "original" if speech else self.audio_source_combo.currentData(),
             "model": self.model_combo.currentData(),
-            "no_vad": self.no_vad_cb.isChecked() and self.model_combo.currentData() != LYRIC_MODEL,
+            "no_vad": (not self.no_vad_cb.isChecked() if speech else self.no_vad_cb.isChecked()) and self.model_combo.currentData() != LYRIC_MODEL,
             "no_burn": self.no_burn_cb.isChecked(),
             "refresh": self.refresh_cb.isChecked(),
-            "ocr_assist": self.ocr_assist_cb.isChecked() and self.model_combo.currentData() != LYRIC_MODEL,
+            "ocr_assist": self.ocr_assist_cb.isChecked() and self.model_combo.currentData() != LYRIC_MODEL and not speech,
             "subtitle_font": self.subtitle_font_combo.currentData(),
             "subtitle_size": self.subtitle_size_spin.value(),
         }
@@ -1228,10 +1299,10 @@ class App(QMainWindow):
             if not Path(video).is_file():
                 messagebox.showwarning("视频不存在", video)
                 return
-            if not lyrics:
+            if not speech and not lyrics:
                 messagebox.showwarning("缺少歌词", "请选择歌词文件。")
                 return
-            if not Path(lyrics).is_file():
+            if not speech and not Path(lyrics).is_file():
                 messagebox.showwarning("歌词不存在", lyrics)
                 return
             config.update(
@@ -1245,7 +1316,7 @@ class App(QMainWindow):
             if not video_dir or not Path(video_dir).is_dir():
                 messagebox.showwarning("视频目录无效", "请选择包含视频的目录。")
                 return
-            if not lyrics_dir or not Path(lyrics_dir).is_dir():
+            if not speech and (not lyrics_dir or not Path(lyrics_dir).is_dir()):
                 messagebox.showwarning("歌词目录无效", "请选择包含歌词的目录。")
                 return
             config.update(
@@ -1307,6 +1378,8 @@ class App(QMainWindow):
             "started_at": datetime.now().astimezone().isoformat(),
             "status": "starting",
             "mode": config["mode"],
+            "task": config.get("task", "lyrics"),
+            "language": config.get("language", "ja"),
             "audio_source": config["audio_source"],
             "model": config["model"],
             "ocr_assist": config.get("ocr_assist", False),
@@ -1446,7 +1519,7 @@ class App(QMainWindow):
                     f"扫描画面歌词 · {event['count']}/{event['total']}",
                     "working",
                 )
-            elif event["kind"] == "lyric_progress":
+            elif event["kind"] in {"lyric_progress", "speech_progress"}:
                 self.progress_bar.setValue(event["progress"])
                 self._apply_status(f"{event['phase']} · {event['count']}/{event['total']}", "working")
             elif event["kind"] == "log":
@@ -1473,6 +1546,8 @@ class App(QMainWindow):
         self.start_btn.setEnabled(not running)
         self.start_btn.setText("处理中" if running else "开始处理")
         self.mode_tabs.setEnabled(not running)
+        self.task_combo.setEnabled(not running)
+        self.language_combo.setEnabled(not running)
         self.audio_source_combo.setEnabled(not running)
         self.model_combo.setEnabled(not running)
         self.no_burn_cb.setEnabled(not running)

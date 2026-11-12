@@ -1,80 +1,102 @@
 # 日语歌曲字幕对轴工具
 
-从日语歌曲视频提取音频，通过语音识别或歌词强制对齐确定时间轴，并把逐行中文字幕生成 SRT 或烧入视频。
+支持两种处理模式：
 
-本工具用于把已有中文字幕对到音频时间轴，没有自动翻译功能，亦不是完整的字幕编辑器。
+- **MV 歌词打轴**：需提供逐行对应的中日歌词。
+- **视频自动字幕**：无需原稿，供直播切片等视频使用。
+
+可以生成 SRT 或直接生成嵌入硬字幕的视频，本工具无自动翻译功能。
 
 ## 下载 Release 直接使用（推荐）
 
-普通使用者无需下载源码或安装 PySide6：
-
 1. 在本仓库的 **Releases** 页面下载 `SubtitleSync.exe`。
 2. 双击 `SubtitleSync.exe` 打开界面，无需安装或解压。
-3. 拖入视频和歌词，选择模型与处理方式后开始。
+3. 选择“MV 歌词打轴”或“视频自动字幕”，拖入文件后开始。
 
-Release 中的 EXE 已包含图形界面和核心脚本，但不包含 Whisper、Demucs、OCR 运行库和语音模型。电脑仍需安装 Python 3.10+ 及识别依赖。第一次使用某个语音模型时会自动联网下载；之后会直接使用本机缓存。
-
-如果运行环境不完整，程序会在处理前列出缺少的组件和安装命令。日常使用不需要通过命令行启动界面。
+EXE 仅包含GUI、处理脚本和 Noto 字体。
+音频处理依赖安装在 Python 环境中，安装命令见下方对应路线。模型首次使用时会自动下载到本地。
 
 ## 从源码运行
 
-需要修改程序或自行打包时，再使用源码方式：
+安装 Python 3.12，在项目目录执行：
 
 ```powershell
-pip install -r requirements.txt
-pip install -r requirements-gui.txt
-python subtitle_sync_gui.py
+py -3.12 -m venv .venv-gui
+.\.venv-gui\Scripts\python.exe -m pip install -r requirements-gui.txt
+.\.venv-gui\Scripts\python.exe subtitle_sync_gui.py
 ```
 
-`requirements.txt` 是识别和视频处理依赖；`requirements-gui.txt` 只用于从源码运行或打包图形界面。
+再按使用的路线安装 `.venv-align` 或 `.venv-whisperx`。界面会自动选择对应环境。
 
 ## 适合场景与局限
 
 适合：
 
-- 日语歌曲、MV、Live 等音乐视频。推荐提供行数对应的中文与日文歌词。
-- 访谈、解说、Vlog、动画对白等非音乐视频。语音清楚时通常比歌曲更容易识别。
-- 已经有逐行中文字幕，只需要生成 SRT 时间轴或烧入视频。
-- 画面本身带有日文歌词或硬字幕的视频，可选用 OCR 画面歌词辅助校准。
+- 日语歌曲、MV、Live：提供逐行对应的中日歌词，生成中文时间轴。
+- 访谈、解说、Vlog、直播切片：自动识别并生成原语言字幕。
+- 画面带有日文歌词的 MV：WhisperX 路线可启用 OCR 辅助。
 
 局限：
 
-- **自动对轴结果仅供人工复核，即使使用 `Large v3`，目前算法下个别字幕仍可能有 0–5 秒误差。**
-- 必须提供准备好的中文字幕或歌词。
-- 日语外的语言的歌词解析与匹配效果尚未经过实测。
-- 歌唱、和声、多人重叠、现场噪声、混响和重伴奏都会降低识别与文本锚点覆盖率。
-- 没有匹配到的歌词行会在相邻锚点之间补时间，无法达到逐帧精度。
-- OCR 只能利用视频里确实存在的可读文字；无画面歌词、纯装饰文字、严重旋转或故意提前/延后的歌词可能无效或产生误差。
+- MV 歌词打轴面向日语MV，需要完整的日文原词和行数对应的中文；漏词会严重影响精度。
+- 和声、多人重叠、混响、重伴奏会影响识别和对齐。尤其是MMS+TIFA路线。
+- OCR 需要清晰可读的画面歌词，动态文字、重复短句和提前出现的歌词会影响匹配。
+- MMS+TIFA 路线暂不支持 OCR辅助 和 VAD。
 
-非音乐视频通常直接选择“原始音频”即可；“分离人声”主要用于伴奏较重的歌曲，MV等场景推荐分离人声。
+MV 可选 Demucs 人声分离；视频自动字幕使用原始音频，默认启用 VAD。
 
-## 语音模型
+## 打轴方式与模型
 
-界面提供模型与打轴方式预设，不需要填写模型名称或识别参数：
 
 | 选项 | 适合内容 | 取舍 |
 |---|---|---|
-| `Large v3`（默认） | 日语歌曲、现场、背景声复杂或音质一般的视频 | 精度优先，处理较慢 |
-| `歌词声学对齐`（实验性） | 已有逐行对应的中日歌词的 MV | 歌词强制对齐路线：MMS 整曲声学定位 + TIFA 局部音素精对齐；FP32 |
-| `Large v3 Turbo` | 访谈、解说、Vlog 和一般视频 | 接近 Large v3，处理明显更快 |
+| `歌词声学对齐`（推荐） | 已有逐行对应中日歌词的 MV | MMS+TIFA 路线：轻量准确；FP32 |
+| `Large v3` | 日语歌曲、现场、背景声复杂或音质一般的视频 | Whisper 识别 + WhisperX 对齐，准确度优先 |
+| `Large v3 Turbo` | 访谈、解说、Vlog 和一般视频 | 接近 Large v3，处理速度更快 |
 | `Medium` | 较清晰的语音、硬件资源有限的电脑 | 速度与精度折中 |
-| `Small` | 清晰单人语音、快速草稿、CPU 环境 | 最轻量，不建议用于歌曲和嘈杂音频 |
-
-第一次使用某个模型时，faster-whisper 会从 Hugging Face 自动下载并保存在本机缓存中，之后无需重复下载。切换模型会使当前输出旁的 `.whisper.json` 转录缓存失效并重新识别；模型权重缓存不会被删除。
+| `Small` | 清晰单人语音、快速草稿、CPU 环境 | 最轻量 |
 
 模型能力和相对速度可参考 [OpenAI Whisper 模型表](https://github.com/openai/whisper#available-models-and-languages)，自动下载行为见 [faster-whisper 使用说明](https://github.com/SYSTRAN/faster-whisper#model-conversion)。
 
 ## 对轴方式
 
-### 歌词强制对齐（Forced Alignment，实验性）
+### 视频自动字幕（WhisperX）
 
-新增实验性的歌词强制对齐（Forced Alignment）路线，在“打轴方式”中选择“歌词声学对齐”即可使用。日文原词直接参与音频对齐，再按原词行号把时间映射到中文。
+在顶部“处理模式”选择“视频自动字幕”，拖入视频，选择 Whisper 模型和识别语言后开始。默认使用原始音频并启用 VAD。支持自动检测语言，或手动选择 Whisper 支持的语言；对齐模型按语言自动下载并缓存。
 
-在目前测试的日语 MV 打轴场景中，相比本工具原有的 Whisper Large v3 ASR 路线，该方案对轴更精确，模型也更轻量。在测试中字幕起点与终点相对人工标准轴的平均绝对误差约为0.2秒，已达到可用级别。
+```text
+视频 → 提取音频 → faster-whisper 识别
+     → 释放识别模型 → WhisperX 声学对齐 → 分句 → SRT／烧录视频
+```
 
-但该模式目前仅依据音频确定时间轴，无法自动校正 MV 画面字幕与实际演唱之间的错位，暂不支持 OCR 辅助和 VAD。如果要让字幕适配MV字幕，仍需要手动调整。
+使用 WhisperX 3.8.6 的 41 个默认对齐语言配置。
 
-歌词格式沿用“中文整块＋双空行＋日文整块”，两块非空行数必须一致。中文只用于最后的字幕输出；修改中文翻译可复用声学对齐缓存。纯中文输入和中日行数不一致时会停止并提示检查。
+运行依赖放在独立环境 `.venv-whisperx`。以下为 CPU 安装方式：
+
+```powershell
+py -3.12 -m venv .venv-whisperx
+.\.venv-whisperx\Scripts\python.exe -X utf8 -m pip install torch==2.8.0 torchaudio==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cpu
+.\.venv-whisperx\Scripts\python.exe -X utf8 -m pip install -r requirements-speech.txt
+```
+
+GUI 会优先选用这个环境。生成 `.speech.json` 缓存和 `.alignment.json` 对轴报告；“重新识别”会忽略当前视频的字幕缓存。
+
+命令行：
+
+```powershell
+.\.venv-whisperx\Scripts\python.exe -X utf8 subtitle_sync.py --task speech --video clip.mp4 --language auto --no-burn
+.\.venv-whisperx\Scripts\python.exe -X utf8 subtitle_sync.py --task speech --batch --video-dir ./videos --language en --no-burn
+```
+
+### 歌词声学对齐（MMS+TIFA，推荐）
+
+在“MV 歌词打轴”中选择“歌词声学对齐（推荐）”。这条路线使用歌词强制对齐（Forced Alignment）：日文原词直接参与音频对齐，再按行号把时间映射到中文。
+
+在目前测试的日语 MV 打轴场景中，相比原 Whisper Large v3 ASR 路线，该方案对轴更精确，速度更快，模型也更轻量。
+
+该路线依据演唱时间打轴，需要跟随 MV 画面歌词时，可手动调整字幕时间。
+
+支持“中文整块＋双空行＋日文整块”和逐行 `日文|中文` 格式，两种语言的非空行数必须一致。中文用于字幕输出；修改中文翻译可复用声学对齐缓存。
 
 ```text
 视频 → 提取音频 → 分离人声（可选）
@@ -83,17 +105,14 @@ python subtitle_sync_gui.py
      → 按原词行号映射中文 → SRT + 对轴报告
 ```
 
-首次使用自动下载固定版本的 MMS、TIFA 和日语读音词典，后续从本机缓存加载。依赖单独安装到 `.venv-align`。基础环境已有 PyTorch 和 Demucs 时：
+首次使用下载固定版本的 MMS、TIFA 和日语读音词典。运行依赖安装到 `.venv-align`：
 
 ```powershell
-py -3.12 -m venv --system-site-packages .venv-align
+py -3.12 -m venv .venv-align
 .\.venv-align\Scripts\python.exe -X utf8 -m pip install -r requirements-align.txt
-python subtitle_sync_gui.py
 ```
 
-依赖清单包含 PyTorch 和 Demucs，已有兼容版本会直接复用。GUI 会检查依赖并优先选用 `.venv-align`。
-
-新模式只生成一个 `.alignment.json`，同时保存对齐结果、音素明细、缓存及待复核行。
+除 SRT 和可选的视频外，还会生成一个 `.alignment.json` 对轴报告。
 
 命令行入口：
 
@@ -101,11 +120,11 @@ python subtitle_sync_gui.py
 .\.venv-align\Scripts\python.exe subtitle_sync.py --video song.mp4 --lyrics song.txt --model lyrics-mms-tifa --no-burn
 ```
 
-本模式仍处于实验阶段，部分句子的起止时间仍可能有偏差，生成后需要人工复核。模型权重为非商业许可，见 [第三方许可](THIRD_PARTY_NOTICES.md)。
+MMS 与 TIFA 权重使用 CC BY-NC-SA 4.0，见 [第三方许可](THIRD_PARTY_NOTICES.md)。
 
-### Whisper 文本匹配
+### MV WhisperX 对齐
 
-推荐使用逐行双语歌词：
+在“MV 歌词打轴”模式中选择任一 Whisper 模型，即使用 WhisperX 路线。需要逐行对应的日文原词和中文字幕，支持现有整块分隔格式，也支持逐行格式：
 
 ```text
 世界の終わりで|在世界终结之处
@@ -118,33 +137,28 @@ python subtitle_sync_gui.py
 ```text
 视频 → FFmpeg 提取音频 → Demucs 人声分离（可选）
      → Whisper 逐词识别
-     → 日文歌词与识别文本进行顺序受限匹配
-     → 高分匹配作为时间锚点，漏识别行在相邻锚点间局部补齐
+     → 日文歌词与识别文本建立定位锚点
+     → WhisperX 用日文原歌词进行字符级声学对齐
+     → 按原词行号映射中文字幕
      → 可选 OCR 扫描画面歌词，校正局部漂移和明显错位边界
      → SRT + 对轴报告 → 可选 FFmpeg 硬字幕烧入
 ```
 
-有日文原文时，程序会在 Whisper 独立识别完成后比较日文歌词与识别文字。没有日文原文时，程序优先使用中文字幕中的英文/数字短语建立局部锚点；可用锚点不足时才使用低置信度时间比例回退。
+定位时没有匹配到的歌词，会连同相邻已定位歌词一起交给 WhisperX 对齐。未完整对齐但有识别锚点的行保留锚点时间，记为 `asr_anchor`；没有定位结果的行写入报告并停止输出新 SRT。对齐缓存保存在 `.alignment.json` 的 `whisperx` 字段中，修改中文翻译可复用，修改日文原词后重新对齐。
+
+运行环境使用上文的 `.venv-whisperx` 与 `requirements-speech.txt`；MMS＋TIFA 仍使用独立的 `.venv-align`。
 
 ## 运行环境
 
-- Python 3.10+
-- FFmpeg（推荐加入系统 `PATH`）
+- Python 3.12
+- FFmpeg
 - 使用画面歌词辅助时需要 RapidOCR 与 ONNX Runtime
-- 首次使用所选模型时需要联网自动下载
-- 8GB以上的运行内存（使用large v3时）
 
-Release 用户和源码用户都需要安装识别依赖：
-
-```powershell
-pip install -r requirements.txt
-```
-
-有 NVIDIA 显卡时需要安装与本机 CUDA 环境匹配的 PyTorch/CTranslate2 运行库。没有可用 GPU 时，Whisper 使用 CPU `int8`，歌词声学对齐使用 FP32。速度虽然会慢一些，但也属于能接受的范畴。
+GPU 运行需要匹配的 PyTorch/CTranslate2 CUDA 运行库。
 
 ## 歌词格式
 
-### 逐行日中双语（精确模式，推荐）
+### 逐行日中双语
 
 使用 `|` 或 Tab 分隔：
 
@@ -166,16 +180,7 @@ pip install -r requirements.txt
 生まれた光
 ```
 
-**连续两个及以上空行会被当作明确的块分隔符**；单个空行只用于歌词段落排版并会被忽略。没有双空行时，程序继续通过日文假名位置兼容旧歌词文件。两段行数相同时会按行配对。行数不一致时，程序会给出警告。
-
-### 纯中文（不推荐）
-
-```text
-在世界终结之处
-诞生的光芒
-```
-
-精度很差。歌词中存在足够英文/数字短语时会使用这些内容作为低置信度顺序锚点，其余行仅在相邻锚点间补齐；否则只能利用声音片段边界估算时间。如非实在没办法尽量不要使用。
+**连续两个及以上空行是块分隔符**；中文块在前、日文块在后，逐行对应，非空行数相同。MV 两条路线都需要双语歌词；视频自动字幕无需歌词。
 
 ## 界面与命令行
 
@@ -189,12 +194,12 @@ pip install -r requirements.txt
 - Demucs 人声或原始混合音频
 - 仅生成 SRT
 - 硬字幕字体与字号选择：Noto Sans 中文、Noto Sans 日文、微软雅黑
-- 强制重新运行 Whisper
-- 可选的 OCR 画面歌词辅助校准
-- 启用或禁用 VAD
+- 重新对齐或重新识别
+- MV WhisperX 路线可选 OCR 画面歌词辅助
+- Whisper 路线可启用或禁用 VAD
 - 固定显示当前阶段、进度条和已运行时间
 
-GUI 启动处理前会扫描项目虚拟环境、`PATH` 和 Windows Python Launcher 注册的解释器，并逐一检查 Python 版本及 `faster_whisper`、`rapidfuzz`、`demucs` 等模块。选择 Demucs 人声时，缺少 `demucs` 的解释器不会被采用；开启画面歌词辅助时还会检查 `rapidocr` 与 `onnxruntime`。没有合格环境时会在提取音频前停止并列出缺失模块。
+GUI 按所选路线检查 Python 环境和依赖，优先使用项目中的 `.venv-align` 或 `.venv-whisperx`。缺少组件时会显示安装命令。
 
 可使用环境变量 `SUBTITLE_SYNC_PYTHON` 指定专用解释器。
 
@@ -209,53 +214,32 @@ logs/run-YYYYMMDD-HHMMSS.log
 logs/run-YYYYMMDD-HHMMSS.json
 ```
 
-从 `release/SubtitleSync.exe` 启动时，日志位于 `release/logs/`。排查问题时无需复制 GUI 中的输出，直接检查 `latest.log` 和 `latest.json` 即可。
+EXE 的日志位于程序同目录的 `logs/`；源码运行时位于项目的 `logs/`。
 
-### 单文件
+### MV 单文件
 
-```powershell
-python subtitle_sync.py --video song.mp4 --lyrics song.txt
-```
-
-先检查字幕和报告，不烧录视频：
+MMS+TIFA，仅生成 SRT：
 
 ```powershell
-python subtitle_sync.py --video song.mp4 --lyrics song.txt --no-burn
+.\.venv-align\Scripts\python.exe subtitle_sync.py --video song.mp4 --lyrics song.txt --model lyrics-mms-tifa --no-burn
 ```
 
-`--no-burn` 只跳过最后的 FFmpeg 视频重编码；首次运行仍需进行音频提取、可选的 Demucs 人声分离和 Whisper 识别，因此不会立刻完成。识别结果写入 `.whisper.json` 后，只要视频、VAD、音源和识别配置不变，更换歌词或调整对轴算法都会直接复用缓存。GUI 会持续显示当前阶段和已运行时间，完整输出另存到日志文件。
-
-使用原始混合音频识别，跳过 Demucs：
+WhisperX，使用 Large v3：
 
 ```powershell
-python subtitle_sync.py --video song.mp4 --lyrics song.txt --audio-source original
+.\.venv-whisperx\Scripts\python.exe subtitle_sync.py --video song.mp4 --lyrics song.txt --model large-v3 --no-burn
 ```
 
-使用速度更快的 Turbo 模型：
+常用参数：
 
-```powershell
-python subtitle_sync.py --video song.mp4 --lyrics song.txt --model large-v3-turbo
-```
+- `--no-burn`：只生成字幕和报告；去掉后烧录视频。
+- `--audio-source original`：使用原始混合音频；默认 `vocals` 分离人声。
+- `--refresh-transcript`：重新对齐或重新识别。
+- `--no-vad`：Whisper 识别保留所有音频区间。
+- `--ocr-assist`：MV WhisperX 路线启用 OCR，默认每 0.5 秒扫描一帧。
+- `--min-match-score 60`：MV WhisperX 路线的文本定位锚点最低相似度。
 
-忽略已有转录缓存并重新识别：
-
-```powershell
-python subtitle_sync.py --video song.mp4 --lyrics song.txt --refresh-transcript
-```
-
-视频本身带有歌词或硬字幕时，开启画面文字辅助：
-
-```powershell
-python subtitle_sync.py --video song.mp4 --lyrics song.txt --ocr-assist
-```
-
-该模式默认每 0.5 秒扫描一次全画面，首次运行会多花数分钟，并生成 `.ocr.json` 画面文字缓存；之后可直接复用。只有检测到足够多的高分歌词锚点才会修改时间轴，否则自动保留 Whisper 结果。RapidOCR 的模型随 Python 包安装，无需让用户填写模型参数，支持情况见 [RapidOCR 模型列表](https://rapidai.github.io/RapidOCRDocs/main/model_list/)。
-
-调整文本锚点最低相似度：
-
-```powershell
-python subtitle_sync.py --video song.mp4 --lyrics song.txt --min-match-score 60
-```
+OCR 使用 RapidOCR，模型随 Python 包安装，扫描结果保存在 `.ocr.json`。
 
 ### 批量处理
 
@@ -267,7 +251,7 @@ lyrics/song_a.txt
 ```
 
 ```powershell
-python subtitle_sync.py --batch --video-dir ./videos --lyrics-dir ./lyrics
+.\.venv-align\Scripts\python.exe subtitle_sync.py --batch --video-dir ./videos --lyrics-dir ./lyrics --model lyrics-mms-tifa --no-burn
 ```
 
 ## 输出文件
@@ -277,20 +261,17 @@ python subtitle_sync.py --batch --video-dir ./videos --lyrics-dir ./lyrics
 | 文件 | 用途 |
 |---|---|
 | `song_subtitled.mp4` | 烧入硬字幕的视频；使用 `--no-burn` 时不生成 |
-| `song_subtitled.srt` | 始终生成的字幕文件 |
-| `song_subtitled.alignment.json` | 每行时间、匹配文字、文本/OCR 分数、Whisper 词概率、状态和待检查行 |
-| `song_subtitled.whisper.json` | Whisper 原始片段与逐词时间缓存 |
+| `song_subtitled.srt` | 字幕文件 |
+| `song_subtitled.alignment.json` | 对轴报告；MMS+TIFA 和 MV WhisperX 也在此保存对齐缓存 |
+| `song_subtitled.whisper.json` | MV WhisperX 路线的原始识别片段与逐词时间缓存 |
+| `song_subtitled.speech.json` | 视频自动字幕的识别与对齐缓存 |
 | `song_subtitled.ocr.json` | 开启画面歌词辅助时生成的 OCR 扫描缓存 |
 
-`alignment.json` 中的主要状态：
+报告中的时间来源：
 
-- `matched`：文本匹配分数较高
-- `low_confidence`：达到锚点阈值，但建议复核
-- `latin_anchor`：纯中文歌词中匹配到的英文/数字弱锚点，仍建议复核
-- `interpolated`：Whisper 漏识别，时间由相邻锚点局部补齐
-- `timing_fallback`：没有日文原文，只能按声音边界估算
-
-修改歌词、对轴算法或相似度阈值时可以直接复用 `.whisper.json`，无需重新运行 Demucs 和 Whisper。OCR 扫描结果也会单独复用 `.ocr.json`。输入视频、模型、VAD、音源或识别配置变化时，相应缓存会自动失效。
+- MMS+TIFA：`refined` 使用局部精对齐结果，`coarse_only` 使用 MMS 整曲对齐结果。
+- MV WhisperX：`whisperx` 为字符级声学对齐，`asr_anchor` 为识别文本锚点时间，`unresolved` 为未定位行。
+- 视频自动字幕：`aligned_segments` 和 `asr_segments` 分别统计声学对齐片段与保留识别时间的片段。
 
 ## 项目结构
 
@@ -302,15 +283,19 @@ Subtitle-tool/
 ├─ subtitle_style.py         字幕字体预设与压制样式
 ├─ assets/fonts/             内置 Noto Sans CJK 字体与许可
 ├─ lyric_alignment/          歌词声学对齐核心、模型资源与输出流程
-├─ requirements.txt          识别和视频处理依赖
+├─ requirements.txt          基础识别、OCR 和视频处理依赖
 ├─ requirements-gui.txt      源码运行与打包 GUI 的依赖
-├─ requirements-align.txt    可选歌词声学对齐运行依赖
+├─ requirements-align.txt    MMS+TIFA 运行依赖
+├─ requirements-speech.txt   WhisperX 两种模式的运行依赖
+├─ speech_catalog.py         识别语言与对齐模型目录
+├─ speech_subtitles.py       视频自动识别与 WhisperX 对齐
+├─ mv_whisperx.py            MV 原歌词的 WhisperX 逐行对齐
 ├─ build.spec                PyInstaller 打包配置
 ├─ tests/                    对轴、缓存和 GUI 测试
 ├─ tools/benchmark_asr.py     独立转录文字与时间误差评测
 ├─ tools/benchmark_lyrics.py  歌词声学对齐多曲回归与逐句误差评测
 ├─ dist/                     打包输出（不提交到 Git）
-│  └─ SubtitleSync.exe       可单独发布的 Windows 图形界面程序
+│  └─ SubtitleSync.exe        可单独发布的 Windows 图形界面程序
 ├─ LICENSE                   MIT License
 ├─ THIRD_PARTY_NOTICES.md     第三方模型与许可
 └─ README.md                 使用说明
@@ -318,11 +303,10 @@ Subtitle-tool/
 ## 打包说明
 
 ```powershell
-pip install -r requirements-gui.txt
-pyinstaller build.spec
+.\.venv-gui\Scripts\python.exe -m PyInstaller build.spec
 ```
 
-打包后的 `SubtitleSync.exe` 内置 PySide6 界面及处理脚本，但不内置语音识别、Demucs、RapidOCR 运行库和模型。目标机器仍需安装可用的 Python 3.10+ 及运行依赖；歌词声学对齐使用 `requirements-align.txt`。EXE 会优先使用同目录的 `subtitle_sync.py`；更新外置脚本时应一并更新 `asr_models.py` 和 `lyric_alignment/`。
+输出为 `dist/SubtitleSync.exe`。EXE 内置 PySide6、处理脚本、字体和许可文件；音频处理在独立 Python 环境中运行。外置更新核心脚本时，需要同时更新对应模块：`lyric_alignment/` 或 `speech_catalog.py`、`speech_subtitles.py`、`mv_whisperx.py`，以及共用的 `asr_models.py`、`subtitle_style.py`。
 
 ## 测试
 
@@ -330,8 +314,8 @@ pyinstaller build.spec
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖文本匹配、漏识别局部补齐、重复副歌顺序、纯中文回退、缓存校验、对轴报告、Python 环境选择和 GUI 日志精简规则。
+测试覆盖双语行映射、声学对齐、WhisperX 字符时间映射、字幕分句、缓存、对轴报告、Python 环境选择和 GUI 控件。
 
 ## 许可证
 
-本项目自身代码采用 [MIT License](LICENSE)。发布源码、Release 和派生版本时应保留许可证与版权声明。第三方模型与资源分别遵守其上游许可；MMS 日语卡拉 OK 对齐与 TIFA 预训练权重使用 CC BY-NC-SA 4.0，不属于本项目 MIT 授权范围，详见 [第三方许可](THIRD_PARTY_NOTICES.md)。
+项目代码采用 [MIT License](LICENSE)。第三方代码、模型、词典与字体的许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

@@ -1,0 +1,11 @@
+# -*- coding: utf-8 -*-
+# 普通视频字幕及 MV WhisperX：faster-whisper 识别 + WhisperX 声学对齐。
+# 独立环境 .venv-whisperx；CPU 版 torch 可先从 PyTorch CPU 源安装。
+whisperx==3.8.6
+transformers>=4.48,<5
+av>=11,<17
+imageio-ffmpeg>=0.5
+soundfile>=0.13
+rapidfuzz>=3
+demucs>=4,<5
+rapidocr>=3.9,<4

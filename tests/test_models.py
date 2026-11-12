@@ -33,9 +33,11 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertNotIn("qwen3_asr", record["modules"])
         self.assertNotIn("nagisa", record["modules"])
 
-    def test_whisper_mode_has_no_transformers_requirement(self):
+    def test_mv_whisper_mode_requires_whisperx_alignment(self):
         required = gui._required_modules({"model": "large-v3", "audio_source": "original"})
-        self.assertEqual(required, {"faster_whisper", "rapidfuzz", "imageio_ffmpeg"})
+        self.assertIn("whisperx", required)
+        self.assertIn("transformers", required)
+        self.assertNotIn("g2pflow", required)
 
     def test_cached_whisper_flow_does_not_run_audio_processing(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -48,6 +50,14 @@ class ModelCatalogTests(unittest.TestCase):
             ])]
             metadata = sync._transcript_metadata(video, True, "vocals", "large-v3")
             sync.save_transcript_cache(output.with_suffix(".whisper.json"), segments, metadata)
+            import mv_whisperx as mv
+            from dataclasses import asdict
+            rows = [sync.AlignmentItem(1, 2, "第一行", source_text="一番目", status="whisperx"),
+                    sync.AlignmentItem(3, 4, "第二行", source_text="二番目", status="whisperx")]
+            source = [sync.LyricLine("一番目", "第一行"), sync.LyricLine("二番目", "第二行")]
+            backend = {"metadata": mv.metadata(metadata, source), "items": [asdict(item) for item in rows],
+                       "aligned_lines": 2, "asr_anchor_lines": 0, "unresolved_lines": []}
+            sync.save_alignment_report(rows, output.with_suffix(".alignment.json"), 55, whisperx_backend=backend)
             with patch.object(sync, "transcribe_audio", side_effect=AssertionError("unexpected inference")), \
                  patch.object(sync, "extract_audio", side_effect=AssertionError("unexpected extraction")):
                 sync.process_single(video, lyrics, output, model_name="large-v3", no_burn=True)
