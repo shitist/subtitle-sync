@@ -15,6 +15,6 @@ soundfile>=0.13,<0.14
 einops>=0.8,<1
 omegaconf>=2.3,<3
 pydantic>=2.11,<3
-g2pflow[ja,lstm]==0.3.1
+g2pflow[all]==0.4.0
 loguru>=0.7,<1
 imageio-ffmpeg>=0.5
